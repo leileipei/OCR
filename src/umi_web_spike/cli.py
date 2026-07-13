@@ -14,6 +14,7 @@ import psutil
 from .contracts import ProbeResult
 from .pdf_probe import add_invisible_text_layer, render_pages
 from .plugin_runner import PluginRunner
+from .report import build_report
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -92,6 +93,13 @@ def _validate_ocr(args: argparse.Namespace) -> int:
     return 0 if image_ok and pdf_ok and searchable_text and not qt_loaded else 1
 
 
+def _build_report(args: argparse.Namespace) -> int:
+    passed = build_report(
+        Path(args.results_dir), Path(args.e10), Path(args.output)
+    )
+    return 0 if passed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="umi-web-spike")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -107,6 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         validate.add_argument("--" + name, required=True)
     validate.set_defaults(handler=_validate_ocr)
+    report = subparsers.add_parser("build-report")
+    report.add_argument("--results-dir", required=True)
+    report.add_argument("--e10", required=True)
+    report.add_argument("--output", required=True)
+    report.set_defaults(handler=_build_report)
     return parser
 
 
