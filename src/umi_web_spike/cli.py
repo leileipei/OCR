@@ -30,6 +30,7 @@ from .evidence import (
 )
 from .pdf_probe import add_invisible_text_layer, render_pages
 from .plugin_runner import PluginRunner
+from .readiness import build_ocr_readiness_report, export_review_bundle
 from .report import build_report
 
 
@@ -444,6 +445,32 @@ def _build_report(args: argparse.Namespace) -> int:
     return 0 if build_report(Path(args.results_dir), Path(args.e10), Path(args.output)) else 1
 
 
+def _build_ocr_readiness(args: argparse.Namespace) -> int:
+    try:
+        succeeded = build_ocr_readiness_report(
+            args.campaign_id,
+            Path(args.interactive_dir),
+            Path(args.scheduled_dir),
+            Path(args.output),
+        )
+    except (OSError, ValueError):
+        return 1
+    return 0 if succeeded else 1
+
+
+def _export_review_bundle(args: argparse.Namespace) -> int:
+    try:
+        export_review_bundle(
+            args.campaign_id,
+            Path(args.interactive_dir),
+            Path(args.scheduled_dir),
+            Path(args.output),
+        )
+    except (OSError, ValueError):
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="umi-web-spike")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -464,6 +491,18 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--e10", required=True)
     report.add_argument("--output", required=True)
     report.set_defaults(handler=_build_report)
+    readiness = subparsers.add_parser("build-ocr-readiness")
+    readiness.add_argument("--campaign-id", required=True)
+    readiness.add_argument("--interactive-dir", required=True)
+    readiness.add_argument("--scheduled-dir", required=True)
+    readiness.add_argument("--output", required=True)
+    readiness.set_defaults(handler=_build_ocr_readiness)
+    review = subparsers.add_parser("export-review-bundle")
+    review.add_argument("--campaign-id", required=True)
+    review.add_argument("--interactive-dir", required=True)
+    review.add_argument("--scheduled-dir", required=True)
+    review.add_argument("--output", required=True)
+    review.set_defaults(handler=_export_review_bundle)
     return parser
 
 
