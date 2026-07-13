@@ -123,6 +123,71 @@ function Get-Phase0WellKnownSids {
     return [pscustomobject]@{ administrators = $administrators; system = $system }
 }
 
+function Initialize-Phase0NativeLogon {
+    if (-not ('UmiOcrPhase0NativeLogon' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class UmiOcrPhase0NativeLogon {
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern bool LogonUser(string user, string domain, string password,
+        int logonType, int logonProvider, out IntPtr token);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr handle);
+}
+'@
+    }
+}
+
+function Test-Phase0IdentityAdministrator {
+    param([System.Security.Principal.WindowsIdentity]$Identity)
+    $administratorSid = 'S-1-5-32-544'
+    $principal = New-Object System.Security.Principal.WindowsPrincipal($Identity)
+    if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) { return $true }
+    foreach ($group in $Identity.Groups) {
+        if ($group.Value -eq $administratorSid) { return $true }
+    }
+    return $false
+}
+
+function Assert-Phase0ScheduledCredentialNonAdministrator {
+    param([System.Management.Automation.PSCredential]$Credential,
+        [System.Security.Principal.SecurityIdentifier]$ExpectedSid)
+    Initialize-Phase0NativeLogon
+    $network = $Credential.GetNetworkCredential()
+    $password = $network.Password
+    $token = [IntPtr]::Zero
+    $identity = $null
+    try {
+        $domain = if ([string]::IsNullOrWhiteSpace($network.Domain)) { $null } else { $network.Domain }
+        if (-not [UmiOcrPhase0NativeLogon]::LogonUser($network.UserName, $domain, $password, 3, 0, [ref]$token)) {
+            throw "Scheduled credential token validation failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+        }
+        $identity = New-Object System.Security.Principal.WindowsIdentity($token)
+        if ($identity.User.Value -ne $ExpectedSid.Value) { throw 'Scheduled credential SID does not match the resolved account' }
+        if (Test-Phase0IdentityAdministrator -Identity $identity) {
+            throw 'Scheduled execution account must not belong to BUILTIN\Administrators'
+        }
+    }
+    finally {
+        if ($null -ne $identity) { $identity.Dispose() }
+        if ($token -ne [IntPtr]::Zero) { $null = [UmiOcrPhase0NativeLogon]::CloseHandle($token) }
+        $password = $null; $network = $null
+    }
+}
+
+function Assert-Phase0CurrentScheduledIdentityNonAdministrator {
+    param([string]$ExpectedSid)
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        if ($identity.User.Value -ne $ExpectedSid) { throw 'Scheduled runner identity SID mismatch' }
+        if (Test-Phase0IdentityAdministrator -Identity $identity) {
+            throw 'Scheduled runner must not execute with an Administrators token'
+        }
+    }
+    finally { $identity.Dispose() }
+}
+
 function New-Phase0ScheduleSecurity {
     param([System.Security.Principal.SecurityIdentifier]$AccountSid, [switch]$Directory)
     $sids = Get-Phase0WellKnownSids
@@ -570,7 +635,7 @@ function Read-Phase0InstallMetadata {
 }
 
 function Read-Phase0TrustedRunnerArguments {
-    param([string]$PackageRoot, [string]$ArgumentFile)
+    param([string]$PackageRoot, [string]$ArgumentFile, [switch]$EnforceCurrentIdentity)
     $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
     $relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $ArgumentFile
     $trustedArgument = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative
@@ -584,6 +649,9 @@ function Read-Phase0TrustedRunnerArguments {
         $metadataPath = Join-Path ([System.IO.Path]::GetDirectoryName($trustedArgument)) 'install-metadata.json'
         $metadataRecord = Read-Phase0InstallMetadata -PackageRoot $root -MetadataPath $metadataPath
         $metadata = $metadataRecord.value
+        if ($EnforceCurrentIdentity) {
+            Assert-Phase0CurrentScheduledIdentityNonAdministrator -ExpectedSid $metadata.account_sid
+        }
         $secureParent = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetDirectoryName($trustedArgument))
         $attemptParent = [System.IO.Path]::GetDirectoryName($secureParent)
         $null = Assert-Phase0RestrictedSchedulePath -Path $attemptParent -AccountSid $metadata.account_sid -Kind Directory
@@ -815,6 +883,43 @@ function Move-Phase0InstallMetadataToTerminal {
     return $target
 }
 
+function Invoke-Phase0RegistrationCompensation {
+    param([string]$PackageRoot, [string]$CampaignId, [string]$ValidationId, [string]$TaskName,
+        $Attempt, [string]$InstallErrorType)
+    $stopSucceeded = $true; $unregisterSucceeded = $true; $cleanupErrorType = $null
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -ne $task) {
+        if ([string]$task.State -in @('Running', 'Queued')) {
+            try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+            catch { $stopSucceeded = $false; $cleanupErrorType = $_.Exception.GetType().FullName }
+        }
+        try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop }
+        catch {
+            $unregisterSucceeded = $false
+            if ($null -eq $cleanupErrorType) { $cleanupErrorType = $_.Exception.GetType().FullName }
+        }
+    }
+    $record = [ordered]@{
+        schema_version = '1.0'; campaign_id = $CampaignId; validation_id = $ValidationId
+        install_attempt = [int]$Attempt.number; task_name = $TaskName
+        recorded_at_utc = [DateTime]::UtcNow.ToString('o'); lifecycle_status = 'terminal-install-failed'
+        install_error_type = $InstallErrorType; cleanup_attempted = $true
+        stop_succeeded = $stopSucceeded; unregister_succeeded = $unregisterSucceeded
+        cleanup_error_type = $cleanupErrorType; orphaned_task = (-not $unregisterSucceeded)
+    }
+    try {
+        $path = Write-Phase0SchedulerJson -PackageRoot $PackageRoot `
+            -Path (Join-Path $Attempt.root 'scheduled-install-compensation.json') -Value $record
+    }
+    catch {
+        $recordErrorType = $_.Exception.GetType().FullName
+        throw "Registration compensation record failed for $TaskName; install=$InstallErrorType; cleanup=$cleanupErrorType; record=$recordErrorType"
+    }
+    $result = [pscustomobject]$record
+    $result | Add-Member -NotePropertyName path -NotePropertyValue $path
+    return $result
+}
+
 function Install-Phase0ScheduledTask {
     param([string]$PackageRoot, [string]$CampaignId, [string]$ValidationId,
         [string]$CommandPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
@@ -842,6 +947,7 @@ function Install-Phase0ScheduledTask {
     if ($null -eq $Credential) { $Credential = Get-Credential -Message 'Phase 0 scheduled-task account' }
     $userName = $Credential.UserName
     $accountSid = (New-Object System.Security.Principal.NTAccount($userName)).Translate([System.Security.Principal.SecurityIdentifier])
+    Assert-Phase0ScheduledCredentialNonAdministrator -Credential $Credential -ExpectedSid $accountSid
     $attempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId
     $configuration = Get-Phase0RunnerConfiguration -PackageRoot $PackageRoot -CampaignId $CampaignId -ValidationId $ValidationId -ExecutionMode Scheduled -Attempt $attempt
     $null = Assert-Phase0RunnerConfiguration -PackageRoot $PackageRoot -Configuration $configuration
@@ -857,52 +963,70 @@ function Install-Phase0ScheduledTask {
     $TaskSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 6) -StartWhenAvailable
     $TaskPrincipal = New-ScheduledTaskPrincipal -UserId $accountSid.Value -LogonType Password -RunLevel Highest
     $TaskDefinition = New-ScheduledTask -Action $TaskAction -Settings $TaskSettings -Principal $TaskPrincipal
-    $PlainPassword = $Credential.GetNetworkCredential().Password
-    try { Register-ScheduledTask -TaskName $TaskName -InputObject $TaskDefinition -User $userName -Password $PlainPassword | Out-Null }
-    finally { $PlainPassword = $null; $Credential = $null }
-    $installedXml = Export-ScheduledTask -TaskName $TaskName
-    $argumentRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $argumentRecord.path
-    $secureRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $secureDirectory
-    $structuredDefinition = [ordered]@{
-        account_sid = $accountSid.Value; execute = $definition.execute
-        runner_relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path (Get-Phase0RunnerScript $root)
-        argument_file_relative = $argumentRelative; arguments_sha256 = Get-Phase0TextSha256 -Text $definition.arguments
-        logon_type = 'Password'; run_level = 'HighestAvailable'; execution_time_limit = 'PT6H'
-        start_when_available = $true; action_count = 1
-    }
-    $metadata = [ordered]@{
-        schema_version = '1.0'; campaign_id = $CampaignId; validation_id = $ValidationId; install_attempt = $attempt.number
-        task_name = $TaskName; installed_at_utc = [DateTime]::UtcNow.ToString('o'); account_sid = $accountSid.Value
-        secure_directory_relative = $secureRelative; argument_file_relative = $argumentRelative
-        argument_sha256 = $argumentRecord.sha256; structured_definition = $structuredDefinition
-        installed_task_xml_sha256 = Get-Phase0TextSha256 -Text $installedXml
-    }
-    if (-not (Test-Phase0InstalledTaskXml -PackageRoot $root -Metadata ([pscustomobject]$metadata) -TaskXml $installedXml)) {
-        throw 'Installed scheduled task does not match the intended definition'
-    }
-    $metadataRecord = Write-Phase0RestrictedJsonAtomic -PackageRoot $root -Directory $secureDirectory -Name 'install-metadata.json' -Value $metadata -AccountSid $accountSid
-    $schedule = [pscustomobject]@{ metadata = [pscustomobject]$metadata; metadata_path = $metadataRecord.path; final = $false }
-    try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
-    catch {
-        $startFailure = $_
-        try {
-            $null = Publish-Phase0ScheduledCollection -PackageRoot $root -CampaignId $CampaignId -Schedule $schedule `
-                -Passed $false -Final $true -LastTaskResult -1 -ValidationErrorCode 'SCHEDULED_TASK_START_FAILED' `
-                -TaskDefinitionValid $true -Configuration $configuration -TaskXmlSha256 $metadata.installed_task_xml_sha256 `
-                -LifecycleStatus 'terminal-start-failed'
+    $registered = $false; $metadataDurable = $false
+    $PlainPassword = $null
+    try {
+        $PlainPassword = $Credential.GetNetworkCredential().Password
+        Register-ScheduledTask -TaskName $TaskName -InputObject $TaskDefinition -User $userName -Password $PlainPassword | Out-Null
+        $registered = $true
+        $installedXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        $argumentRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $argumentRecord.path
+        $secureRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $secureDirectory
+        $structuredDefinition = [ordered]@{
+            account_sid = $accountSid.Value; execute = $definition.execute
+            runner_relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path (Get-Phase0RunnerScript $root)
+            argument_file_relative = $argumentRelative; arguments_sha256 = Get-Phase0TextSha256 -Text $definition.arguments
+            logon_type = 'Password'; run_level = 'HighestAvailable'; execution_time_limit = 'PT6H'
+            start_when_available = $true; action_count = 1
         }
+        $metadata = [ordered]@{
+            schema_version = '1.0'; campaign_id = $CampaignId; validation_id = $ValidationId; install_attempt = $attempt.number
+            task_name = $TaskName; installed_at_utc = [DateTime]::UtcNow.ToString('o'); account_sid = $accountSid.Value
+            secure_directory_relative = $secureRelative; argument_file_relative = $argumentRelative
+            argument_sha256 = $argumentRecord.sha256; structured_definition = $structuredDefinition
+            installed_task_xml_sha256 = Get-Phase0TextSha256 -Text $installedXml
+        }
+        if (-not (Test-Phase0InstalledTaskXml -PackageRoot $root -Metadata ([pscustomobject]$metadata) -TaskXml $installedXml)) {
+            throw 'Installed scheduled task does not match the intended definition'
+        }
+        $metadataRecord = Write-Phase0RestrictedJsonAtomic -PackageRoot $root -Directory $secureDirectory -Name 'install-metadata.json' -Value $metadata -AccountSid $accountSid
+        $metadataDurable = $true
+        $schedule = [pscustomobject]@{ metadata = [pscustomobject]$metadata; metadata_path = $metadataRecord.path; final = $false }
+        try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
         catch {
-            if ($_.Exception.Data['Phase0StatePublished']) { throw }
+            $startFailure = $_
             try {
-                if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-                    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-                }
-                $null = Move-Phase0InstallMetadataToTerminal -Schedule $schedule -Reason 'start-failed'
+                $null = Publish-Phase0ScheduledCollection -PackageRoot $root -CampaignId $CampaignId -Schedule $schedule `
+                    -Passed $false -Final $true -LastTaskResult -1 -ValidationErrorCode 'SCHEDULED_TASK_START_FAILED' `
+                    -TaskDefinitionValid $true -Configuration $configuration -TaskXmlSha256 $metadata.installed_task_xml_sha256 `
+                    -LifecycleStatus 'terminal-start-failed'
             }
-            catch { throw 'Scheduled task start failed and lifecycle compensation also failed' }
-            throw $startFailure
+            catch {
+                if ($_.Exception.Data['Phase0StatePublished']) { throw }
+                try {
+                    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+                        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+                    }
+                    $null = Move-Phase0InstallMetadataToTerminal -Schedule $schedule -Reason 'start-failed'
+                }
+                catch { throw 'Scheduled task start failed and lifecycle compensation also failed' }
+                throw $startFailure
+            }
         }
     }
+    catch {
+        $installFailure = $_
+        if ($registered -and -not $metadataDurable) {
+            $installErrorType = $installFailure.Exception.GetType().FullName
+            $compensation = Invoke-Phase0RegistrationCompensation -PackageRoot $root -CampaignId $CampaignId `
+                -ValidationId $ValidationId -TaskName $TaskName -Attempt $attempt -InstallErrorType $installErrorType
+            if (-not $compensation.unregister_succeeded) {
+                throw "Registration compensation left orphan $TaskName; install=$installErrorType; cleanup=$($compensation.cleanup_error_type)"
+            }
+        }
+        throw $installFailure
+    }
+    finally { $PlainPassword = $null; $Credential = $null }
     return $definition
 }
 
@@ -1058,12 +1182,26 @@ function Remove-Phase0ScheduledTask {
     $schedules = @(Get-Phase0ScheduleRecords -PackageRoot $PackageRoot -CampaignId $CampaignId | Where-Object {
         $_.metadata.validation_id -eq $ValidationId
     })
-    if ($schedules.Count -lt 1) { throw 'No scheduled-task lifecycle record exists for cleanup' }
     $pending = @($schedules | Where-Object { -not $_.final })
     if ($pending.Count -gt 1) { throw 'Only one uncollected scheduled task is allowed per campaign' }
     $TaskName = "UmiOcrPhase0-$ValidationId"
-    $null = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($null -eq $task) { throw 'No scheduled task exists for explicit cleanup' }
+    if ([string]$task.State -in @('Running', 'Queued')) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    if ($schedules.Count -lt 1) {
+        $attempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId
+        $record = [ordered]@{
+            schema_version = '1.0'; campaign_id = $CampaignId; validation_id = $ValidationId
+            cleanup_attempt = [int]$attempt.number; task_name = $TaskName
+            recorded_at_utc = [DateTime]::UtcNow.ToString('o'); lifecycle_status = 'terminal-cleaned-orphan'
+        }
+        $path = Write-Phase0SchedulerJson -PackageRoot $PackageRoot `
+            -Path (Join-Path $attempt.root 'scheduled-orphan-cleanup.json') -Value $record
+        return [pscustomobject]@{ validation_id = $ValidationId; lifecycle_status = 'terminal-cleaned-orphan'; final = $true; path = $path }
+    }
     if ($pending.Count -eq 1) {
         try {
             return Publish-Phase0ScheduledCollection -PackageRoot $PackageRoot -CampaignId $CampaignId -Schedule $pending[0] `

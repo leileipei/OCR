@@ -44,7 +44,7 @@ function Assert-Phase0RunnerArguments {
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'ArgumentFile') {
-  $configuration = Read-Phase0TrustedRunnerArguments -PackageRoot $PackageRoot -ArgumentFile $ArgumentFile
+  $configuration = Read-Phase0TrustedRunnerArguments -PackageRoot $PackageRoot -ArgumentFile $ArgumentFile -EnforceCurrentIdentity
 }
 else {
   if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {

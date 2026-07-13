@@ -354,6 +354,51 @@ def test_scheduled_failures_and_cleanup_are_terminal_and_auditable():
     assert "-CampaignId $CampaignId" in remove_call
 
 
+def test_post_registration_failures_share_compensation_boundary_and_orphan_cleanup():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    install = text.split("function Install-Phase0ScheduledTask", 1)[1].split(
+        "function Test-Phase0InstalledTaskXml", 1
+    )[0]
+    cleanup = text.split("function Remove-Phase0ScheduledTask", 1)[1].split(
+        "Export-ModuleMember", 1
+    )[0]
+    assert "$registered = $false" in install
+    assert "$metadataDurable = $false" in install
+    assert "$registered = $true" in install
+    assert "$metadataDurable = $true" in install
+    assert "Invoke-Phase0RegistrationCompensation" in install
+    for operation in (
+        "Export-ScheduledTask",
+        "Test-Phase0InstalledTaskXml",
+        "Write-Phase0RestrictedJsonAtomic -PackageRoot $root -Directory $secureDirectory -Name 'install-metadata.json'",
+    ):
+        assert install.index("$registered = $true") < install.index(operation)
+        assert install.index(operation) < install.index("$metadataDurable = $true")
+    assert "scheduled-install-compensation.json" in text
+    assert "install_error_type" in text
+    assert "cleanup_error_type" in text
+    assert "Stop-ScheduledTask" in text
+    assert "Unregister-ScheduledTask" in text
+    assert "scheduled-orphan-cleanup.json" in cleanup
+    assert "Get-ScheduledTask -TaskName $TaskName" in cleanup
+
+
+def test_scheduled_credentials_and_runner_reject_effective_administrator_tokens():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    install = text.split("function Install-Phase0ScheduledTask", 1)[1].split(
+        "function Test-Phase0InstalledTaskXml", 1
+    )[0]
+    assert "Assert-Phase0ScheduledCredentialNonAdministrator" in text
+    assert "Assert-Phase0CurrentScheduledIdentityNonAdministrator" in text
+    assert "WindowsPrincipal" in text
+    assert "BuiltinAdministratorsSid" in text
+    assert "LogonUser" in text
+    assert "S-1-5-32-544" in text
+    assert install.index("Assert-Phase0ScheduledCredentialNonAdministrator") < install.index(
+        "Get-Phase0AttemptContext"
+    )
+
+
 def test_collection_exactly_binds_installed_task_definition():
     text = SCHEDULER.read_text(encoding="utf-8")
     for required in (
@@ -472,8 +517,11 @@ $module = Import-Module '{SCHEDULER}' -Force -PassThru
         [pscustomobject]@{{
             arguments = $arguments.path; metadata = $metadata.path; secure = $secure
             logs = $runtime.logs; output = $runtime.output; temp = $runtime.temp
+            attempt = $attemptPath; run = Join-Path $attemptPath 'run'
+            scheduled = Join-Path $attemptPath 'run\scheduled'
         }}
     }} $root $sid
+    $null = & $module {{ param($Credential, $Sid) Assert-Phase0ScheduledCredentialNonAdministrator -Credential $Credential -ExpectedSid $Sid }} $credential $sid
     $argumentsHash = (Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash
     $metadataHash = (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash
     $child = @"
@@ -493,15 +541,33 @@ foreach (`$target in @('$($paths.arguments)', '$($paths.metadata)')) {{
     }}
 }}
 try {{ [System.IO.Directory]::Delete('$($paths.secure)', `$true); exit 13 }} catch [System.UnauthorizedAccessException] {{ }}
+foreach (`$rootPath in @(
+    '$($paths.attempt)', '$($paths.run)', '$($paths.scheduled)',
+    '$($paths.logs)', '$($paths.output)', '$($paths.temp)'
+)) {{
+    try {{ [System.IO.Directory]::Delete(`$rootPath, `$true); exit 14 }} catch [System.UnauthorizedAccessException] {{ }}
+    try {{ [System.IO.Directory]::Move(`$rootPath, (`$rootPath + '.moved')); exit 15 }} catch [System.UnauthorizedAccessException] {{ }}
+}}
 exit 0
 "@
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
-    $process = Start-Process -FilePath $PSHOME\powershell.exe -Credential $credential `
+    $hostExecutable = (Get-Process -Id $PID).Path
+    $process = Start-Process -FilePath $hostExecutable -Credential $credential `
         -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "non-admin ACL probe failed: $($process.ExitCode)" }}
     if ((Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash -ne $argumentsHash -or
         (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash -ne $metadataHash) {{
         throw 'secure schedule evidence changed during low-privilege probe'
+    }}
+    $administratorGroup = (New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')).Translate(
+        [System.Security.Principal.NTAccount]
+    ).Value.Split('\')[-1]
+    Add-LocalGroupMember -Group $administratorGroup -Member $userName
+    try {{
+        $null = & $module {{ param($Credential, $Sid) Assert-Phase0ScheduledCredentialNonAdministrator -Credential $Credential -ExpectedSid $Sid }} $credential $sid
+        throw 'administrator credential was accepted'
+    }} catch {{
+        if ($_.Exception.Message -eq 'administrator credential was accepted') {{ throw }}
     }}
 }}
 catch {{
@@ -521,6 +587,61 @@ finally {{
     )
     if result.returncode == 77:
         pytest.skip("Windows host cannot provision a temporary non-admin local account")
+    assert result.returncode == 0, result.stderr
+
+
+def test_registration_compensation_removes_fault_injected_tasks_on_windows():
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or not powershell:
+        pytest.skip("Task Scheduler compensation requires a Windows host")
+    script = rf"""
+if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {{ exit 77 }}
+$root = Join-Path $env:ProgramData ('UmiOcrCompensationTest-' + [guid]::NewGuid().ToString('N'))
+$module = Import-Module '{SCHEDULER}' -Force -PassThru
+$createdTasks = @()
+try {{
+    foreach ($definition in @(
+        [pscustomobject]@{{ number = 1; stage = 'ExportScheduledTaskException' }},
+        [pscustomobject]@{{ number = 2; stage = 'TaskXmlMismatchException' }},
+        [pscustomobject]@{{ number = 3; stage = 'MetadataPublishException' }}
+    )) {{
+        $campaign = 'campaign-compensation'
+        $validation = 'fault-' + $definition.number
+        $taskName = 'UmiOcrPhase0-' + $validation
+        $attemptRoot = Join-Path $root ("work\campaigns\$campaign\attempts\attempt-" + ('{{0:D4}}' -f $definition.number))
+        $null = New-Item -ItemType Directory -Path $attemptRoot -Force
+        $attempt = [pscustomobject]@{{ root = $attemptRoot; number = $definition.number }}
+        $action = New-ScheduledTaskAction -Execute $env:ComSpec -Argument '/d /c exit 0'
+        Register-ScheduledTask -TaskName $taskName -Action $action -User 'SYSTEM' -RunLevel Highest | Out-Null
+        $createdTasks += $taskName
+        $record = & $module {{
+            param($Root, $Campaign, $Validation, $TaskName, $Attempt, $ErrorType)
+            Invoke-Phase0RegistrationCompensation -PackageRoot $Root -CampaignId $Campaign `
+                -ValidationId $Validation -TaskName $TaskName -Attempt $Attempt -InstallErrorType $ErrorType
+        }} $root $campaign $validation $taskName $attempt $definition.stage
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {{ throw 'fault left an orphan task' }}
+        if (-not $record.unregister_succeeded -or $record.install_error_type -ne $definition.stage) {{
+            throw 'compensation record did not bind the injected stage'
+        }}
+        $path = Join-Path $attemptRoot 'scheduled-install-compensation.json'
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ throw 'compensation record is missing' }}
+    }}
+}}
+finally {{
+    foreach ($taskName in $createdTasks) {{
+        Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+    }}
+    if (Test-Path -LiteralPath $root) {{ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }}
+}}
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode == 77:
+        pytest.skip("Windows host does not expose ScheduledTasks cmdlets")
     assert result.returncode == 0, result.stderr
 
 
