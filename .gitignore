@@ -6,3 +6,11 @@ __pycache__/
 .DS_Store
 validation/results/*
 !validation/results/.gitkeep
+/build/
+/dist/
+/downloads/
+/wheelhouse/
+/work/
+*.zip
+*.7z.exe
+*.whl
