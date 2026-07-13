@@ -143,7 +143,7 @@ def _validate_sample(
         _error(errors, source, "样本记录必须是对象")
         return None
     category = sample.get("category")
-    if category not in EXPECTED_OUTCOMES:
+    if not isinstance(category, str) or category not in EXPECTED_OUTCOMES:
         _error(errors, source, "样本类别无效：{}".format(category))
         return None
     expected = EXPECTED_OUTCOMES[category]
@@ -152,24 +152,33 @@ def _validate_sample(
     if sample.get("actual") != expected:
         _error(errors, source, "{} 的实际结果与预期不一致".format(category))
     _require_bool(sample, "ok", source, errors, True)
-    if not isinstance(sample.get("path"), str) or not sample["path"].strip():
+    raw_path = sample.get("path")
+    path_is_valid = isinstance(raw_path, str) and bool(raw_path.strip())
+    if not path_is_valid:
         _error(errors, source, "{} 缺少样本路径".format(category))
     digest = sample.get("input_sha256")
     if not isinstance(digest, str) or not HASH_PATTERN.fullmatch(digest):
         _error(errors, source, "{} 的输入 SHA-256 无效".format(category))
-    else:
-        sample_path = Path(sample.get("path", ""))
-        if not sample_path.is_absolute() or not sample_path.is_file():
+    elif path_is_valid:
+        try:
+            sample_path = Path(raw_path)
+            if not sample_path.is_absolute() or not sample_path.is_file():
+                _error(
+                    errors,
+                    source,
+                    "{} 的样本路径必须是存在的绝对文件路径".format(category),
+                )
+            elif sha256_file(sample_path) != digest:
+                _error(
+                    errors,
+                    source,
+                    "{} 的输入 SHA-256 与实际文件不一致".format(category),
+                )
+        except (OSError, ValueError) as error:
             _error(
                 errors,
                 source,
-                "{} 的样本路径必须是存在的绝对文件路径".format(category),
-            )
-        elif sha256_file(sample_path) != digest:
-            _error(
-                errors,
-                source,
-                "{} 的输入 SHA-256 与实际文件不一致".format(category),
+                "{} 的样本文件读取失败：{}".format(category, error),
             )
     if category in ("simplified_chinese_image", "mixed_chinese_english_image"):
         if sample.get("input_nonblank") is not True:
@@ -298,6 +307,11 @@ def _validate_resources(
     if details.get("worker_calculation_basis") != WORKER_CALCULATION_BASIS:
         _error(errors, source, "worker_calculation_basis 与固定计算口径不一致")
     _require_bool(details, "qt_loaded", source, errors, False)
+    qt_processes = details.get("qt_processes")
+    if not isinstance(qt_processes, list):
+        _error(errors, source, "qt_processes 必须是数组")
+    elif qt_processes:
+        _error(errors, source, "qt_processes 必须为空")
     session_id = details.get("windows_session_id")
     if not isinstance(session_id, int) or isinstance(session_id, bool):
         _error(errors, source, "windows_session_id 必须是整数")
@@ -433,12 +447,27 @@ def validate_ocr_evidence(
                     "manifest",
                     "manifest.evidence.{} SHA-256 摘要无效".format(name),
                 )
-            elif not evidence_path.is_file() or sha256_file(evidence_path) != digest:
-                _error(
-                    errors,
-                    "manifest",
-                    "manifest.evidence.{} SHA-256 与实际文件不一致".format(name),
-                )
+            else:
+                try:
+                    if (
+                        not evidence_path.is_file()
+                        or sha256_file(evidence_path) != digest
+                    ):
+                        _error(
+                            errors,
+                            "manifest",
+                            "manifest.evidence.{} SHA-256 与实际文件不一致".format(
+                                name
+                            ),
+                        )
+                except (OSError, ValueError) as error:
+                    _error(
+                        errors,
+                        "manifest",
+                        "manifest.evidence.{} 文件读取失败：{}".format(
+                            name, error
+                        ),
+                    )
 
     resource_details = values["resources"].get("details")
     if not isinstance(resource_details, dict):

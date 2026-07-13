@@ -151,6 +151,7 @@ def valid_evidence(root, validation_id, execution_mode):
             "cpu_worker_limit": 4,
             "business_concurrency_limit": 2,
             "qt_loaded": False,
+            "qt_processes": [],
             "windows_session_id": 0 if scheduled else 1,
             "interactive_session": not scheduled,
             "headless": scheduled,
