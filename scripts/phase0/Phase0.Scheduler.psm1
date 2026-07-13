@@ -592,6 +592,17 @@ function Assert-Phase0RunnerConfiguration {
     if ([string]$Configuration.plugin_name -ne 'win7_x64_RapidOCR-json') { throw 'Untrusted OCR plugin name' }
     foreach ($name in @('project_root', 'umi_data_root', 'test_python_exe', 'python_exe', 'plugin_root', 'global_options', 'local_options', 'samples_manifest')) {
         $path = [string]$Configuration.$name
+        if ($name -eq 'project_root') {
+            $projectPath = [System.IO.Path]::GetFullPath($path).TrimEnd('\', '/')
+            if ($projectPath.Equals($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $rootItem = Get-Item -LiteralPath $root -Force
+                if (-not $rootItem.PSIsContainer) { throw 'Trusted project root is not a regular directory' }
+                if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw 'Trusted project root is a reparse point'
+                }
+                continue
+            }
+        }
         $relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $path
         $null = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative
     }

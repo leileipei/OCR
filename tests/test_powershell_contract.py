@@ -388,6 +388,25 @@ def test_runner_revalidates_trusted_relationships_not_only_json_keys():
     assert "Resolve-Path -LiteralPath $ArgumentFile" not in runner
 
 
+def test_runner_allows_only_the_trusted_repository_project_root_special_case():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    assert "$name -eq 'project_root'" in text
+    assert "$projectPath.Equals($root, [System.StringComparison]::OrdinalIgnoreCase)" in text
+    assert "Get-Item -LiteralPath $root -Force" in text
+    assert "Trusted project root is not a regular directory" in text
+    assert "Trusted project root is a reparse point" in text
+    for name in (
+        "umi_data_root",
+        "test_python_exe",
+        "python_exe",
+        "plugin_root",
+        "global_options",
+        "local_options",
+        "samples_manifest",
+    ):
+        assert name in text
+
+
 def test_install_and_collect_use_distinct_monotonic_attempts_and_retry_states():
     text = SCHEDULER.read_text(encoding="utf-8")
     entry = ENTRY.read_text(encoding="utf-8")
@@ -985,6 +1004,21 @@ def test_runner_relationship_guard_rejects_arbitrary_python_on_windows(tmp_path)
     assert result.returncode == 0, result.stderr
 
     configuration["python_exe"] = str(umi / "runtime" / "python.exe")
+    serialized = json.dumps(configuration).replace("'", "''")
+    script = (
+        f"Import-Module '{SCHEDULER}' -Force; "
+        f"$c = '{serialized}' | ConvertFrom-Json; "
+        f"$null = Assert-Phase0RunnerConfiguration -PackageRoot '{tmp_path}' -Configuration $c; "
+        "exit 0"
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
     output = Path(configuration["output_dir"])
     output.parent.mkdir(parents=True, exist_ok=True)
     outside = tmp_path / "outside-output"
