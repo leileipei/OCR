@@ -1,0 +1,10 @@
+{
+  "samples": [
+    {"category": "simplified_chinese_image", "path": "C:\\Phase0Samples\\zh.png"},
+    {"category": "mixed_chinese_english_image", "path": "C:\\Phase0Samples\\mixed.png"},
+    {"category": "scanned_pdf_rotated_blank", "path": "C:\\Phase0Samples\\scan-100.pdf"},
+    {"category": "native_text_pdf", "path": "C:\\Phase0Samples\\native.pdf"},
+    {"category": "corrupt_pdf", "path": "C:\\Phase0Samples\\corrupt.pdf"},
+    {"category": "encrypted_pdf", "path": "C:\\Phase0Samples\\encrypted.pdf"}
+  ]
+}
