@@ -28,6 +28,7 @@ from .evidence import (
     write_json,
     WORKER_CALCULATION_BASIS,
 )
+from .evidence_validation import validate_ocr_evidence
 from .pdf_probe import add_invisible_text_layer, render_pages
 from .plugin_runner import PluginRunner
 from .readiness import build_ocr_readiness_report, export_review_bundle
@@ -476,6 +477,40 @@ def _export_review_bundle(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_ocr_evidence_command(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    if output.exists():
+        return 1
+    try:
+        campaign_id = validate_validation_id(args.campaign_id)
+        validation_id = validate_validation_id(args.validation_id)
+        validation = validate_ocr_evidence(
+            Path(args.results_dir), expected_mode=args.expected_mode
+        )
+        bindings_match = (
+            validation.campaign_id == campaign_id
+            and validation.validation_id == validation_id
+        )
+        ok = validation.ok and bindings_match
+        error_code = None if ok else (
+            "INVALID_OCR_EVIDENCE" if not validation.ok else "EVIDENCE_BINDING_MISMATCH"
+        )
+        write_json(
+            output,
+            {
+                "campaign_id": campaign_id,
+                "evidence_validation_ok": ok,
+                "expected_mode": args.expected_mode,
+                "validation_error_code": error_code,
+                "validation_id": validation_id,
+                "windows_session_id": validation.summary.get("windows_session_id"),
+            },
+        )
+    except (OSError, ValueError):
+        return 1
+    return 0 if ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="umi-web-spike")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -508,6 +543,15 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--scheduled-dir", required=True)
     review.add_argument("--output", required=True)
     review.set_defaults(handler=_export_review_bundle)
+    evidence_check = subparsers.add_parser("validate-ocr-evidence")
+    evidence_check.add_argument("--results-dir", required=True)
+    evidence_check.add_argument(
+        "--expected-mode", choices=("interactive", "scheduled"), required=True
+    )
+    evidence_check.add_argument("--campaign-id", required=True)
+    evidence_check.add_argument("--validation-id", required=True)
+    evidence_check.add_argument("--output", required=True)
+    evidence_check.set_defaults(handler=_validate_ocr_evidence_command)
     return parser
 
 

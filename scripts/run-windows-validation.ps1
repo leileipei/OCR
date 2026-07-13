@@ -1,7 +1,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Direct')]
 param(
   [Parameter(Mandatory=$true, ParameterSetName='ArgumentFile')][string]$ArgumentFile,
-  [Parameter(ParameterSetName='Direct')][string]$ProjectRoot = (Resolve-Path ".").Path,
+  [Parameter(ParameterSetName='Direct')][string]$ProjectRoot = '',
   [Parameter(Mandatory=$true, ParameterSetName='Direct')][string]$UmiDataRoot,
   [Parameter(Mandatory=$true, ParameterSetName='Direct')][string]$TestPythonExe,
   [Parameter(Mandatory=$true, ParameterSetName='Direct')][string]$PythonExe,
@@ -12,6 +12,7 @@ param(
   [Parameter(Mandatory=$true, ParameterSetName='Direct')][string]$SamplesManifest,
   [Parameter(ParameterSetName='Direct')][string]$ValidationId = ([guid]::NewGuid().ToString('N')),
   [Parameter(Mandatory=$true, ParameterSetName='Direct')][string]$CampaignId,
+  [Parameter(Mandatory=$true, ParameterSetName='Direct')][int]$Attempt,
   [Parameter(Mandatory=$true, ParameterSetName='Direct')]
   [ValidateSet('Interactive', 'Scheduled')][string]$ExecutionMode,
   [Parameter(ParameterSetName='Direct')][string]$OutputDir = '',
@@ -22,80 +23,68 @@ param(
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Stop'
+
+$parent = [System.IO.Path]::GetDirectoryName($PSScriptRoot)
+$PackageRoot = if ([System.IO.Path]::GetFileName($parent) -eq 'toolkit') {
+  [System.IO.Path]::GetDirectoryName($parent)
+} else { $parent }
+$PackageRoot = [System.IO.Path]::GetFullPath($PackageRoot)
+$schedulerModule = Join-Path $PackageRoot 'Phase0.Scheduler.psm1'
+if (-not (Test-Path -LiteralPath $schedulerModule -PathType Leaf)) {
+  $schedulerModule = Join-Path $PackageRoot 'scripts/phase0/Phase0.Scheduler.psm1'
+}
+Import-Module $schedulerModule -Force
 
 function Assert-Phase0RunnerArguments {
   param($Values)
-  $required = @(
-    'project_root', 'umi_data_root', 'test_python_exe', 'python_exe', 'plugin_root', 'plugin_name',
-    'global_options', 'local_options', 'samples_manifest', 'validation_id', 'campaign_id',
-    'execution_mode', 'output_dir', 'min_pages', 'business_concurrency_limit', 'stdout_log', 'stderr_log'
-  )
-  $actual = @($Values.PSObject.Properties.Name | Sort-Object)
-  if (@(Compare-Object ($required | Sort-Object) $actual).Count -ne 0) {
-    throw 'Scheduled argument file contains unexpected or missing fields'
-  }
-  foreach ($name in @('validation_id', 'campaign_id')) {
-    if ([string]$Values.$name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') {
-      throw "Invalid scheduled argument identifier: $name"
-    }
-  }
-  if ($Values.validation_id -eq $Values.campaign_id) { throw 'ValidationId and CampaignId must be different' }
-  if ([string]$Values.execution_mode -notin @('Interactive', 'Scheduled')) { throw 'Invalid execution mode' }
-  if ([int]$Values.min_pages -lt 1 -or [int]$Values.business_concurrency_limit -lt 1) { throw 'Validation limits must be positive' }
-  $hasStdout = -not [string]::IsNullOrWhiteSpace([string]$Values.stdout_log)
-  $hasStderr = -not [string]::IsNullOrWhiteSpace([string]$Values.stderr_log)
-  if ($hasStdout -ne $hasStderr) { throw 'Standard output and error logs must be configured together' }
+  $validated = Assert-Phase0RunnerConfiguration -PackageRoot $PackageRoot -Configuration $Values
+  return $validated
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'ArgumentFile') {
-  $ArgumentFile = (Resolve-Path -LiteralPath $ArgumentFile).Path
-  $argumentValues = [System.IO.File]::ReadAllText($ArgumentFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
-  Assert-Phase0RunnerArguments -Values $argumentValues
-  $ProjectRoot = [string]$argumentValues.project_root
-  $UmiDataRoot = [string]$argumentValues.umi_data_root
-  $TestPythonExe = [string]$argumentValues.test_python_exe
-  $PythonExe = [string]$argumentValues.python_exe
-  $PluginRoot = [string]$argumentValues.plugin_root
-  $PluginName = [string]$argumentValues.plugin_name
-  $GlobalOptions = [string]$argumentValues.global_options
-  $LocalOptions = [string]$argumentValues.local_options
-  $SamplesManifest = [string]$argumentValues.samples_manifest
-  $ValidationId = [string]$argumentValues.validation_id
-  $CampaignId = [string]$argumentValues.campaign_id
-  $ExecutionMode = [string]$argumentValues.execution_mode
-  $OutputDir = [string]$argumentValues.output_dir
-  $MinPages = [int]$argumentValues.min_pages
-  $BusinessConcurrencyLimit = [int]$argumentValues.business_concurrency_limit
-  $StdoutLog = [string]$argumentValues.stdout_log
-  $StderrLog = [string]$argumentValues.stderr_log
+  $configuration = Read-Phase0TrustedRunnerArguments -PackageRoot $PackageRoot -ArgumentFile $ArgumentFile
 }
 else {
-  $directValues = [pscustomobject]@{
-    project_root = $ProjectRoot; umi_data_root = $UmiDataRoot; test_python_exe = $TestPythonExe
-    python_exe = $PythonExe; plugin_root = $PluginRoot; plugin_name = $PluginName; global_options = $GlobalOptions
-    local_options = $LocalOptions; samples_manifest = $SamplesManifest; validation_id = $ValidationId
-    campaign_id = $CampaignId; execution_mode = $ExecutionMode; output_dir = $OutputDir
-    min_pages = $MinPages; business_concurrency_limit = $BusinessConcurrencyLimit
-    stdout_log = $StdoutLog; stderr_log = $StderrLog
+  if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    $ProjectRoot = if (Test-Path -LiteralPath (Join-Path $PackageRoot 'toolkit/src')) {
+      Join-Path $PackageRoot 'toolkit'
+    } else { $PackageRoot }
   }
-  Assert-Phase0RunnerArguments -Values $directValues
+  $attemptName = 'attempt-{0:D4}' -f $Attempt
+  $attemptRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId/attempts/$attemptName"
+  if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path $attemptRoot ("ocr/" + $ExecutionMode.ToLowerInvariant() + "/$ValidationId")
+  }
+  $configuration = [pscustomobject][ordered]@{
+    package_root = $PackageRoot; project_root = $ProjectRoot; umi_data_root = $UmiDataRoot
+    test_python_exe = $TestPythonExe; python_exe = $PythonExe; plugin_root = $PluginRoot; plugin_name = $PluginName
+    global_options = $GlobalOptions; local_options = $LocalOptions; samples_manifest = $SamplesManifest
+    validation_id = $ValidationId; campaign_id = $CampaignId; execution_mode = $ExecutionMode; output_dir = $OutputDir
+    min_pages = $MinPages; business_concurrency_limit = $BusinessConcurrencyLimit
+    stdout_log = $StdoutLog; stderr_log = $StderrLog; attempt = $Attempt
+  }
+  $null = Assert-Phase0RunnerArguments -Values $configuration
 }
 
-$ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
-$RunsRoot = Join-Path $ProjectRoot 'validation\results\runs'
-if ([string]::IsNullOrWhiteSpace($OutputDir)) {
-  $ModeRoot = Join-Path $RunsRoot ($ExecutionMode.ToLowerInvariant())
-  $OutputDir = Join-Path $ModeRoot $ValidationId
-}
-if ($ExecutionMode -eq 'Interactive' -and $OutputDir -match '[\\/]scheduled[\\/]') {
-  throw 'Interactive and scheduled validation output directories must be different'
-}
-if ($ExecutionMode -eq 'Scheduled' -and $OutputDir -match '[\\/]interactive[\\/]') {
-  throw 'Interactive and scheduled validation output directories must be different'
-}
-$ExitCode = 0
-$OriginalPythonPath = $env:PYTHONPATH
+$ProjectRoot = [string]$configuration.project_root
+$UmiDataRoot = [string]$configuration.umi_data_root
+$TestPythonExe = [string]$configuration.test_python_exe
+$PythonExe = [string]$configuration.python_exe
+$PluginRoot = [string]$configuration.plugin_root
+$PluginName = [string]$configuration.plugin_name
+$GlobalOptions = [string]$configuration.global_options
+$LocalOptions = [string]$configuration.local_options
+$SamplesManifest = [string]$configuration.samples_manifest
+$ValidationId = [string]$configuration.validation_id
+$CampaignId = [string]$configuration.campaign_id
+$ExecutionMode = [string]$configuration.execution_mode
+$OutputDir = [string]$configuration.output_dir
+$MinPages = [int]$configuration.min_pages
+$BusinessConcurrencyLimit = [int]$configuration.business_concurrency_limit
+$StdoutLog = [string]$configuration.stdout_log
+$StderrLog = [string]$configuration.stderr_log
+
 $UseLogs = -not [string]::IsNullOrWhiteSpace($StdoutLog) -and -not [string]::IsNullOrWhiteSpace($StderrLog)
 if ($UseLogs) {
   if ($StdoutLog -eq $StderrLog) { throw 'Standard output and error logs must be different' }
@@ -103,25 +92,24 @@ if ($UseLogs) {
     if (Test-Path -LiteralPath $logPath) { throw "Refusing to overwrite validation log: $logPath" }
   }
   foreach ($logPath in @($StdoutLog, $StderrLog)) {
-    $fullLogPath = [System.IO.Path]::GetFullPath($logPath)
-    $parent = [System.IO.Path]::GetDirectoryName($fullLogPath)
-    $null = [System.IO.Directory]::CreateDirectory($parent)
-    $stream = New-Object System.IO.FileStream($fullLogPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+    $stream = New-Object System.IO.FileStream(
+      $logPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read
+    )
     $stream.Dispose()
   }
+}
+elseif (-not [string]::IsNullOrWhiteSpace($StdoutLog) -or -not [string]::IsNullOrWhiteSpace($StderrLog)) {
+  throw 'Standard output and error logs must be configured together'
 }
 
 function Invoke-Phase0Native {
   param([string]$Executable, [string[]]$Arguments)
-  if ($UseLogs) {
-    & $Executable @Arguments 1>> $StdoutLog 2>> $StderrLog
-  }
-  else {
-    & $Executable @Arguments
-  }
-  return [int]$LASTEXITCODE
+  $exitCode = Invoke-Phase0NativeProcess -Executable $Executable -Arguments $Arguments -StdoutLog $StdoutLog -StderrLog $StderrLog
+  return [int]$exitCode
 }
 
+$ExitCode = 1
+$OriginalPythonPath = $env:PYTHONPATH
 Push-Location $ProjectRoot
 try {
   $env:PYTHONPATH = "$ProjectRoot\src"

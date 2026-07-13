@@ -353,7 +353,7 @@ def test_business_concurrency_limit_cannot_be_zero(tmp_path, monkeypatch):
 def test_windows_script_uses_unique_run_and_manifest_contract():
     script = (PROJECT_ROOT / "scripts" / "run-windows-validation.ps1").read_text(encoding="utf-8")
     assert "[string]$ValidationId = ([guid]::NewGuid().ToString('N'))" in script
-    assert "validation\\results\\runs" in script
+    assert "work/campaigns/$CampaignId/attempts/$attemptName" in script
     assert "'validation\\results\\live'" not in script
     assert "'--validation-id', $ValidationId" in script
     assert "'--samples-manifest', $SamplesManifest" in script
@@ -361,3 +361,70 @@ def test_windows_script_uses_unique_run_and_manifest_contract():
     assert "'--business-concurrency-limit', [string]$BusinessConcurrencyLimit" in script
     assert "[int]$BusinessConcurrencyLimit = 5" in script
     assert "[int]$MinPages = 100" in script
+    assert "[int]$Attempt" in script
+
+
+def test_validate_ocr_evidence_cli_writes_minimal_bound_result(tmp_path):
+    from tests.evidence_fixtures import write_evidence
+
+    evidence_dir = tmp_path / "evidence"
+    write_evidence(
+        evidence_dir,
+        validation_id="run-scheduled-cli-001",
+        campaign_id="campaign-cli-001",
+        execution_mode="scheduled",
+    )
+    output = tmp_path / "validation.json"
+
+    assert main(
+        [
+            "validate-ocr-evidence",
+            "--results-dir",
+            str(evidence_dir),
+            "--expected-mode",
+            "scheduled",
+            "--campaign-id",
+            "campaign-cli-001",
+            "--validation-id",
+            "run-scheduled-cli-001",
+            "--output",
+            str(output),
+        ]
+    ) == 0
+
+    value = json.loads(output.read_text(encoding="utf-8"))
+    assert value == {
+        "campaign_id": "campaign-cli-001",
+        "evidence_validation_ok": True,
+        "expected_mode": "scheduled",
+        "validation_error_code": None,
+        "validation_id": "run-scheduled-cli-001",
+        "windows_session_id": 0,
+    }
+
+
+def test_validate_ocr_evidence_cli_rejects_bad_json_without_leaking_content(tmp_path):
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    (evidence_dir / "manifest.json").write_text("{secret invalid", encoding="utf-8")
+    output = tmp_path / "validation.json"
+
+    assert main(
+        [
+            "validate-ocr-evidence",
+            "--results-dir",
+            str(evidence_dir),
+            "--expected-mode",
+            "scheduled",
+            "--campaign-id",
+            "campaign-cli-001",
+            "--validation-id",
+            "run-scheduled-cli-001",
+            "--output",
+            str(output),
+        ]
+    ) == 1
+
+    serialized = output.read_text(encoding="utf-8")
+    assert "secret" not in serialized
+    assert json.loads(serialized)["validation_error_code"] == "INVALID_OCR_EVIDENCE"

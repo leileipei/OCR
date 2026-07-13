@@ -219,6 +219,93 @@ def test_scheduler_restricts_argument_file_and_never_persists_credentials():
         assert forbidden not in text.lower()
 
 
+def test_scheduler_uses_restricted_directory_atomic_files_and_install_hashes():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    for required in (
+        "DirectorySecurity",
+        "SetAccessRuleProtection($true, $false)",
+        "SetOwner",
+        "$secureRelative/schedule-$ValidationId",
+        "FileMode]::CreateNew",
+        "Flush($true)",
+        "[System.IO.File]::Move",
+        "argument_sha256",
+        "account_sid",
+        "installed_task_xml_sha256",
+        "structured_definition",
+        "Assert-Phase0RestrictedSchedulePath",
+    ):
+        assert required in text
+
+
+def test_runner_revalidates_trusted_relationships_not_only_json_keys():
+    scheduler = SCHEDULER.read_text(encoding="utf-8")
+    runner = WINDOWS_RUNNER.read_text(encoding="utf-8")
+    assert "Read-Phase0TrustedRunnerArguments" in runner
+    assert "Assert-Phase0RunnerConfiguration" in scheduler
+    for required in (
+        "runtime/python/python.exe",
+        "Umi-OCR_Rapid_v2.1.5/UmiOCR-data",
+        "runtime/python.exe",
+        "win7_x64_RapidOCR-json",
+        "templates/global-options.json",
+        "templates/local-options.json",
+        "templates/samples.json",
+        "argument_sha256",
+        "install-metadata.json",
+    ):
+        assert required in scheduler
+    assert "Resolve-Path -LiteralPath $ArgumentFile" not in runner
+
+
+def test_install_and_collect_use_distinct_monotonic_attempts_and_retry_states():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    entry = ENTRY.read_text(encoding="utf-8")
+    assert "install_attempt" in text
+    assert "collection_attempt" in text
+    assert "Get-Phase0PendingSchedule" in text
+    assert "Only one uncollected scheduled task is allowed per campaign" in text
+    assert "'INTERACTIVE_OCR_FAILED'" in text
+    assert "'SCHEDULED_OCR_FAILED'" in text
+    assert "-Final $false" in text
+    assert "Get-Phase0AttemptContext" in text
+    allocation_clause = entry.split("if ($Action -in", 1)[1].split("switch ($Action)", 1)[0]
+    for initial_action in ("Preflight", "Prepare", "SelfTest"):
+        assert initial_action in allocation_clause
+    for deferred_action in ("RunInteractive", "InstallScheduledTask", "CollectScheduledTask"):
+        assert deferred_action not in allocation_clause
+    catch_block = entry.split("catch {", 1)[1]
+    assert "InstallScheduledTask'  = 'SCHEDULED_OCR_FAILED'" not in catch_block
+    assert "CollectScheduledTask'  = 'SCHEDULED_OCR_FAILED'" not in catch_block
+
+
+def test_collection_exactly_binds_installed_task_definition():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    for required in (
+        "installed_task_xml_sha256",
+        "UserId",
+        "StartWhenAvailable",
+        "ExecNodes.Count -eq 1",
+        "LogonType",
+        "HighestAvailable",
+        "PT6H",
+        "account_sid",
+    ):
+        assert required in text
+
+
+def test_scheduler_invokes_portable_strict_evidence_validator_and_stable_summary():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    assert "validate-ocr-evidence" in text
+    assert "runtime/python/python.exe" in text
+    assert "--expected-mode" in text
+    assert "--campaign-id" in text
+    assert "--validation-id" in text
+    assert "evidence_validation_ok" in text
+    assert "validation_error_code" in text
+    assert "scheduled-collection.json" in text
+
+
 def test_task_definition_is_password_logon_highest_six_hours_and_dry_run_safe():
     text = SCHEDULER.read_text(encoding="utf-8")
     assert "New-Phase0TaskDefinition" in text
@@ -239,8 +326,8 @@ def test_scheduler_collects_bounded_redacted_evidence_and_reuses_install_attempt
     assert "LastTaskResult" in text
     assert "windows_session_id" in text
     assert "task_xml_sha256" in text
-    assert "Get-Phase0ExistingSchedule" in text
-    assert "Get-Phase0AttemptContext" in ENTRY.read_text(encoding="utf-8")
+    assert "Get-Phase0PendingSchedule" in text
+    assert "Get-Phase0AttemptContext" in text
     assert "log_summaries" in text
     assert "Get-Content -LiteralPath $LogPath" not in text
     assert "$matches = @()" not in text.lower()
@@ -270,9 +357,12 @@ def test_windows_runner_binds_campaign_mode_and_separate_output_directories():
     assert "ParameterSetName='Direct')][string]$CampaignId" in text
     assert "'--campaign-id', $CampaignId" in text
     assert "'--execution-mode', $ExecutionMode.ToLowerInvariant()" in text
-    assert "Join-Path $RunsRoot ($ExecutionMode.ToLowerInvariant())" in text
+    assert '"work/campaigns/$CampaignId/attempts/$attemptName"' in text
     assert "Assert-Phase0RunnerArguments" in text
-    assert "ValidationId and CampaignId" in text
+    assert "ValidationId and CampaignId" in SCHEDULER.read_text(encoding="utf-8")
+    scheduler = SCHEDULER.read_text(encoding="utf-8")
+    assert "| Out-Host" in scheduler
+    assert "return [int]$exitCode" in scheduler
 
 
 def test_task_definition_dry_run_on_windows_without_registration(tmp_path):
@@ -303,6 +393,131 @@ def test_task_definition_dry_run_on_windows_without_registration(tmp_path):
     assert definition["run_level"] == "Highest"
     assert definition["execution_time_limit"] == "PT6H"
     assert definition["argument_file"] == r"C:\phase0\scheduled-arguments.json"
+
+
+def test_native_helper_keeps_stdout_out_of_exit_code_on_windows():
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or not powershell:
+        pytest.skip("Native PowerShell exit behavior requires a Windows host")
+    script = (
+        f"Import-Module '{SCHEDULER}' -Force; "
+        "$a = Invoke-Phase0NativeProcess -Executable $env:ComSpec "
+        "-Arguments @('/d','/c','echo zero-visible & exit /b 0'); "
+        "$b = Invoke-Phase0NativeProcess -Executable $env:ComSpec "
+        "-Arguments @('/d','/c','echo seven-visible & exit /b 7'); "
+        "if ($a -ne 0 -or $b -ne 7) { throw 'native exit code was polluted by stdout' }"
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "zero-visible" in result.stdout
+    assert "seven-visible" in result.stdout
+
+
+def test_runner_relationship_guard_rejects_arbitrary_python_on_windows(tmp_path):
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or not powershell:
+        pytest.skip("Windows path relationship behavior requires a Windows host")
+    campaign_id = "campaign-runner-001"
+    validation_id = "scheduled-runner-001"
+    attempt = tmp_path / "work" / "campaigns" / campaign_id / "attempts" / "attempt-0001"
+    umi = (
+        tmp_path
+        / "work"
+        / "campaigns"
+        / campaign_id
+        / "umi"
+        / "Umi-OCR_Rapid_v2.1.5"
+        / "UmiOCR-data"
+    )
+    for directory in (
+        attempt,
+        tmp_path / "src",
+        tmp_path / "runtime" / "python",
+        tmp_path / "templates",
+        umi / "runtime",
+        umi / "plugins" / "win7_x64_RapidOCR-json",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    for path in (
+        tmp_path / "runtime" / "python" / "python.exe",
+        tmp_path / "templates" / "global-options.json",
+        tmp_path / "templates" / "local-options.json",
+        tmp_path / "templates" / "samples.json",
+        umi / "runtime" / "python.exe",
+    ):
+        path.write_bytes(b"fixture")
+    evil = tmp_path / "evil.exe"
+    evil.write_bytes(b"evil")
+    configuration = {
+        "attempt": 1,
+        "business_concurrency_limit": 5,
+        "campaign_id": campaign_id,
+        "execution_mode": "Scheduled",
+        "global_options": str(tmp_path / "templates" / "global-options.json"),
+        "local_options": str(tmp_path / "templates" / "local-options.json"),
+        "min_pages": 100,
+        "output_dir": str(attempt / "ocr" / "scheduled" / validation_id),
+        "package_root": str(tmp_path),
+        "plugin_name": "win7_x64_RapidOCR-json",
+        "plugin_root": str(umi / "plugins"),
+        "project_root": str(tmp_path),
+        "python_exe": str(evil),
+        "samples_manifest": str(tmp_path / "templates" / "samples.json"),
+        "stderr_log": "",
+        "stdout_log": "",
+        "test_python_exe": str(tmp_path / "runtime" / "python" / "python.exe"),
+        "umi_data_root": str(umi),
+        "validation_id": validation_id,
+    }
+    serialized = json.dumps(configuration).replace("'", "''")
+    script = (
+        f"Import-Module '{SCHEDULER}' -Force; "
+        f"$c = '{serialized}' | ConvertFrom-Json; "
+        f"try {{ Assert-Phase0RunnerConfiguration -PackageRoot '{tmp_path}' -Configuration $c; "
+        "throw 'arbitrary executable accepted' } catch { "
+        "if ($_.Exception.Message -eq 'arbitrary executable accepted') { throw } }"
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    configuration["python_exe"] = str(umi / "runtime" / "python.exe")
+    output = Path(configuration["output_dir"])
+    output.parent.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-output"
+    outside.mkdir()
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(output), str(outside)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if linked.returncode != 0:
+        pytest.skip("The Windows test account cannot create an output junction")
+    serialized = json.dumps(configuration).replace("'", "''")
+    script = (
+        f"Import-Module '{SCHEDULER}' -Force; "
+        f"$c = '{serialized}' | ConvertFrom-Json; "
+        f"try {{ Assert-Phase0RunnerConfiguration -PackageRoot '{tmp_path}' -Configuration $c; "
+        "throw 'output junction accepted' } catch { "
+        "if ($_.Exception.Message -eq 'output junction accepted') { throw } }"
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_runtime_path_guards_on_windows_when_powershell_is_available(tmp_path):
