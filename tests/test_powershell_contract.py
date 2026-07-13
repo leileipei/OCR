@@ -195,6 +195,100 @@ def test_entrypoint_controls_initialization_and_returns_stable_failure():
     assert "$moduleImported" in text
 
 
+def test_powershell_scripts_do_not_assign_the_matches_automatic_variable():
+    powershell_files = sorted(
+        list((ROOT / "scripts").rglob("*.ps1"))
+        + list((ROOT / "scripts").rglob("*.psm1"))
+    )
+    for path in powershell_files:
+        normalized = (
+            path.read_text(encoding="utf-8")
+            .lower()
+            .replace(" ", "")
+            .replace("\t", "")
+        )
+        assert "$matches=" not in normalized, path
+
+    entry = ENTRY.read_text(encoding="utf-8")
+    assert "-ValidationId $InteractiveId -ExecutionMode interactive" in entry
+    assert "-ValidationId $ScheduledId -ExecutionMode scheduled" in entry
+    assert "-ValidationId $state.scheduled_validation_id -ExecutionMode scheduled" in entry
+
+
+def test_entrypoint_resolves_passed_result_directories_on_windows_powershell_51(tmp_path):
+    powershell = shutil.which("powershell")
+    if os.name != "nt" or not powershell:
+        pytest.skip("Result-directory parsing requires Windows PowerShell 5.1")
+
+    package_root = tmp_path / "entry-results"
+    attempts = package_root / "work/campaigns/campaign-results/attempts"
+    interactive = attempts / "attempt-0001/ocr/interactive/interactive-results"
+    scheduled = attempts / "attempt-0002/run/scheduled/output/scheduled-results"
+    interactive.mkdir(parents=True)
+    scheduled.mkdir(parents=True)
+    collection_attempt = attempts / "attempt-0003"
+    collection_attempt.mkdir()
+    (attempts / "attempt-0001/interactive-validation-summary.json").write_text(
+        json.dumps(
+            {
+                "campaign_id": "campaign-results",
+                "validation_id": "interactive-results",
+                "result": "passed",
+                "collection_attempt": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (collection_attempt / "scheduled-collection.json").write_text(
+        json.dumps(
+            {
+                "campaign_id": "campaign-results",
+                "validation_id": "scheduled-results",
+                "result": "passed",
+                "final": True,
+                "collection_attempt": 3,
+                "install_attempt": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    escaped_entry = str(ENTRY).replace("'", "''")
+    escaped_root = str(package_root).replace("'", "''")
+    script = rf"""
+$ErrorActionPreference = 'Stop'
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {{
+    throw 'Windows PowerShell 5.1 is required'
+}}
+$tokens = $null
+$parseErrors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{escaped_entry}', [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -ne 0) {{ throw 'Entry script parse failed' }}
+$required = @('Assert-Phase0EntryIdentifier', 'Assert-Phase0EntryControlledPath', 'Get-Phase0EntryResultsDirectory')
+$definitions = $ast.FindAll({{
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $required -contains $node.Name
+}}, $true)
+if ($definitions.Count -ne $required.Count) {{ throw 'Required entry helpers were not found' }}
+Invoke-Expression (($definitions | ForEach-Object {{ $_.Extent.Text }}) -join [Environment]::NewLine)
+$interactive = Get-Phase0EntryResultsDirectory -PackageRoot '{escaped_root}' `
+    -CampaignId 'campaign-results' -ValidationId 'interactive-results' -ExecutionMode interactive
+$scheduled = Get-Phase0EntryResultsDirectory -PackageRoot '{escaped_root}' `
+    -CampaignId 'campaign-results' -ValidationId 'scheduled-results' -ExecutionMode scheduled
+[pscustomobject]@{{ interactive = $interactive; scheduled = $scheduled }} | ConvertTo-Json -Compress
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    value = json.loads(result.stdout.strip())
+    assert Path(value["interactive"]) == interactive
+    assert Path(value["scheduled"]) == scheduled
+
+
 def test_scheduler_uses_unique_name_and_requires_explicit_cleanup():
     text = SCHEDULER.read_text(encoding="utf-8")
     assert "UmiOcrPhase0-$ValidationId" in text

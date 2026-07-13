@@ -94,7 +94,7 @@ function Get-Phase0EntryResultsDirectory {
     Assert-Phase0EntryIdentifier -Value $ValidationId -Name 'ValidationId'
     $attemptsRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId/attempts"
     $null = Assert-Phase0EntryControlledPath -ControlledRoot $PackageRoot -Path $attemptsRoot -Expected Directory
-    $matches = @()
+    $resultDirectories = @()
     foreach ($directory in Get-ChildItem -LiteralPath $attemptsRoot -Force) {
         if (-not $directory.PSIsContainer -or $directory.Name -notmatch '^attempt-([0-9]{4,10})$' -or
             ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
@@ -124,12 +124,12 @@ function Get-Phase0EntryResultsDirectory {
         }
         $resultRoot = Join-Path $attemptsRoot ('attempt-{0:D4}' -f $resultAttempt)
         $candidate = Join-Path $resultRoot $relative
-        $matches += Assert-Phase0EntryControlledPath -ControlledRoot $attemptsRoot -Path $candidate -Expected Directory
+        $resultDirectories += Assert-Phase0EntryControlledPath -ControlledRoot $attemptsRoot -Path $candidate -Expected Directory
     }
-    if ($matches.Count -ne 1) {
+    if ($resultDirectories.Count -ne 1) {
         throw "Expected exactly one passed $ExecutionMode result directory for $ValidationId"
     }
-    return [string]$matches[0]
+    return [string]$resultDirectories[0]
 }
 
 try {
