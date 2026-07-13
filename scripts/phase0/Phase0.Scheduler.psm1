@@ -885,10 +885,14 @@ function Move-Phase0InstallMetadataToTerminal {
 
 function Invoke-Phase0RegistrationCompensation {
     param([string]$PackageRoot, [string]$CampaignId, [string]$ValidationId, [string]$TaskName,
-        $Attempt, [string]$InstallErrorType)
+        $Attempt, [string]$InstallErrorType, [string]$SecureDirectory,
+        [System.Security.Principal.SecurityIdentifier]$AccountSid, $Definition)
     $stopSucceeded = $true; $unregisterSucceeded = $true; $cleanupErrorType = $null
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $taskXmlSha256 = ''
     if ($null -ne $task) {
+        try { $taskXmlSha256 = Get-Phase0TextSha256 -Text (Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop) }
+        catch { $taskXmlSha256 = '' }
         if ([string]$task.State -in @('Running', 'Queued')) {
             try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
             catch { $stopSucceeded = $false; $cleanupErrorType = $_.Exception.GetType().FullName }
@@ -906,10 +910,15 @@ function Invoke-Phase0RegistrationCompensation {
         install_error_type = $InstallErrorType; cleanup_attempted = $true
         stop_succeeded = $stopSucceeded; unregister_succeeded = $unregisterSucceeded
         cleanup_error_type = $cleanupErrorType; orphaned_task = (-not $unregisterSucceeded)
+        account_sid = $AccountSid.Value; execute = [string]$Definition.execute
+        argument_file_relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $PackageRoot -Path ([string]$Definition.argument_file)
+        arguments_sha256 = Get-Phase0TextSha256 -Text ([string]$Definition.arguments)
+        task_xml_sha256 = $taskXmlSha256
     }
     try {
-        $path = Write-Phase0SchedulerJson -PackageRoot $PackageRoot `
-            -Path (Join-Path $Attempt.root 'scheduled-install-compensation.json') -Value $record
+        $recordFile = Write-Phase0RestrictedJsonAtomic -PackageRoot $PackageRoot -Directory $SecureDirectory `
+            -Name 'scheduled-install-compensation.json' -Value $record -AccountSid $AccountSid
+        $path = $recordFile.path
     }
     catch {
         $recordErrorType = $_.Exception.GetType().FullName
@@ -920,10 +929,89 @@ function Invoke-Phase0RegistrationCompensation {
     return $result
 }
 
+function Get-Phase0InstallCompensationRecords {
+    param([string]$PackageRoot, [string]$CampaignId)
+    $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
+    $attempts = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath "work/campaigns/$CampaignId/attempts"
+    $expectedProperties = @(
+        'account_sid', 'argument_file_relative', 'arguments_sha256', 'campaign_id', 'cleanup_attempted',
+        'cleanup_error_type', 'execute', 'install_attempt', 'install_error_type', 'lifecycle_status',
+        'orphaned_task', 'recorded_at_utc', 'schema_version', 'stop_succeeded', 'task_name',
+        'task_xml_sha256', 'unregister_succeeded', 'validation_id'
+    ) | Sort-Object
+    $records = @()
+    foreach ($attemptDirectory in Get-ChildItem -LiteralPath $attempts -Force) {
+        if (-not $attemptDirectory.PSIsContainer -or $attemptDirectory.Name -notmatch '^attempt-[0-9]{4,10}$' -or
+            ($attemptDirectory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Unexpected attempts entry' }
+        $attemptNumber = [int]$attemptDirectory.Name.Substring('attempt-'.Length)
+        $secure = Join-Path $attemptDirectory.FullName 'secure'
+        if (-not (Test-Path -LiteralPath $secure -PathType Container)) { continue }
+        $accountSid = Assert-Phase0RestrictedSchedulePath -Path $secure -Kind Directory
+        $null = Assert-Phase0RestrictedSchedulePath -Path $attemptDirectory.FullName -AccountSid $accountSid -Kind Directory
+        foreach ($scheduleDirectory in Get-ChildItem -LiteralPath $secure -Force) {
+            if (-not $scheduleDirectory.PSIsContainer -or
+                $scheduleDirectory.Name -notmatch '^schedule-([A-Za-z0-9][A-Za-z0-9._-]{0,127})$' -or
+                ($scheduleDirectory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Unexpected secure schedule entry' }
+            $validationId = $Matches[1]
+            $path = Join-Path $scheduleDirectory.FullName 'scheduled-install-compensation.json'
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $null = Assert-Phase0RestrictedSchedulePath -Path $scheduleDirectory.FullName -AccountSid $accountSid -Kind Directory
+            $null = Assert-Phase0RestrictedSchedulePath -Path $path -AccountSid $accountSid -Kind File
+            $relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $path
+            $trustedPath = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative
+            try { $value = [System.IO.File]::ReadAllText($trustedPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json }
+            catch { throw 'Install compensation record JSON is invalid' }
+            $expectedArgument = "work/campaigns/$CampaignId/attempts/$($attemptDirectory.Name)/secure/schedule-$validationId/arguments.json"
+            $expectedPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            if (@(Compare-Object $expectedProperties @($value.PSObject.Properties.Name | Sort-Object)).Count -ne 0 -or
+                $value.schema_version -ne '1.0' -or $value.lifecycle_status -ne 'terminal-install-failed' -or
+                $value.campaign_id -ne $CampaignId -or $value.validation_id -ne $validationId -or
+                [int]$value.install_attempt -ne $attemptNumber -or $value.task_name -ne "UmiOcrPhase0-$validationId" -or
+                $value.account_sid -ne $accountSid -or $value.argument_file_relative -ne $expectedArgument -or
+                -not ([System.IO.Path]::GetFullPath([string]$value.execute).Equals([System.IO.Path]::GetFullPath($expectedPowerShell), [StringComparison]::OrdinalIgnoreCase)) -or
+                [string]$value.arguments_sha256 -notmatch '^[0-9a-f]{64}$' -or
+                ([string]$value.task_xml_sha256 -ne '' -and [string]$value.task_xml_sha256 -notmatch '^[0-9a-f]{64}$') -or
+                $value.cleanup_attempted -isnot [bool] -or $value.stop_succeeded -isnot [bool] -or
+                $value.unregister_succeeded -isnot [bool] -or $value.orphaned_task -isnot [bool]) {
+                throw 'Install compensation record binding is invalid'
+            }
+            $records += [pscustomobject]@{ value = $value; path = $trustedPath; relative = $relative }
+        }
+    }
+    return $records
+}
+
+function Test-Phase0CompensatedTaskXml {
+    param([string]$PackageRoot, $Compensation, [string]$TaskXml)
+    try {
+        $record = $Compensation.value
+        if (-not [string]::IsNullOrWhiteSpace([string]$record.task_xml_sha256) -and
+            (Get-Phase0TextSha256 -Text $TaskXml) -ne $record.task_xml_sha256) { return $false }
+        [xml]$document = $TaskXml
+        $actions = $document.SelectNodes("//*[local-name()='Actions']/*")
+        $execs = $document.SelectNodes("//*[local-name()='Actions']/*[local-name()='Exec']")
+        if ($actions.Count -ne 1 -or $execs.Count -ne 1) { return $false }
+        $principal = $document.SelectSingleNode("//*[local-name()='Principal']")
+        $userId = $principal.SelectSingleNode("./*[local-name()='UserId']").InnerText
+        $logonType = $principal.SelectSingleNode("./*[local-name()='LogonType']").InnerText
+        $command = $execs[0].SelectSingleNode("./*[local-name()='Command']").InnerText
+        $arguments = $execs[0].SelectSingleNode("./*[local-name()='Arguments']").InnerText
+        $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
+        $argumentFile = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $record.argument_file_relative
+        $expected = New-Phase0TaskDefinition -ValidationId $record.validation_id -CommandPath $record.execute `
+            -RunnerPath (Get-Phase0RunnerScript $root) -ArgumentFile $argumentFile -AccountSid $record.account_sid
+        return $userId -eq $record.account_sid -and $logonType -eq 'Password' -and
+            $command -eq $expected.execute -and $arguments -eq $expected.arguments -and
+            (Get-Phase0TextSha256 -Text $arguments) -eq $record.arguments_sha256
+    }
+    catch { return $false }
+}
+
 function Install-Phase0ScheduledTask {
     param([string]$PackageRoot, [string]$CampaignId, [string]$ValidationId,
         [string]$CommandPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
-        [System.Management.Automation.PSCredential]$Credential, [switch]$DryRun)
+        [System.Management.Automation.PSCredential]$Credential, [switch]$DryRun,
+        [Parameter(DontShow = $true)][ValidateSet('', 'Export', 'Xml', 'Metadata')][string]$FaultInjection = '')
     Assert-Phase0SchedulerIdentifier -Value $ValidationId -Name ValidationId
     $state = Get-Phase0State -PackageRoot $PackageRoot -CampaignId $CampaignId
     if ($state.state -notin @('INTERACTIVE_OCR_PASSED', 'SCHEDULED_OCR_FAILED')) {
@@ -969,6 +1057,7 @@ function Install-Phase0ScheduledTask {
         $PlainPassword = $Credential.GetNetworkCredential().Password
         Register-ScheduledTask -TaskName $TaskName -InputObject $TaskDefinition -User $userName -Password $PlainPassword | Out-Null
         $registered = $true
+        if ($FaultInjection -eq 'Export') { throw (New-Object System.InvalidOperationException('Injected export failure')) }
         $installedXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
         $argumentRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $argumentRecord.path
         $secureRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $secureDirectory
@@ -986,9 +1075,11 @@ function Install-Phase0ScheduledTask {
             argument_sha256 = $argumentRecord.sha256; structured_definition = $structuredDefinition
             installed_task_xml_sha256 = Get-Phase0TextSha256 -Text $installedXml
         }
+        if ($FaultInjection -eq 'Xml') { throw (New-Object System.InvalidOperationException('Injected XML validation failure')) }
         if (-not (Test-Phase0InstalledTaskXml -PackageRoot $root -Metadata ([pscustomobject]$metadata) -TaskXml $installedXml)) {
             throw 'Installed scheduled task does not match the intended definition'
         }
+        if ($FaultInjection -eq 'Metadata') { throw (New-Object System.InvalidOperationException('Injected metadata publish failure')) }
         $metadataRecord = Write-Phase0RestrictedJsonAtomic -PackageRoot $root -Directory $secureDirectory -Name 'install-metadata.json' -Value $metadata -AccountSid $accountSid
         $metadataDurable = $true
         $schedule = [pscustomobject]@{ metadata = [pscustomobject]$metadata; metadata_path = $metadataRecord.path; final = $false }
@@ -1019,7 +1110,8 @@ function Install-Phase0ScheduledTask {
         if ($registered -and -not $metadataDurable) {
             $installErrorType = $installFailure.Exception.GetType().FullName
             $compensation = Invoke-Phase0RegistrationCompensation -PackageRoot $root -CampaignId $CampaignId `
-                -ValidationId $ValidationId -TaskName $TaskName -Attempt $attempt -InstallErrorType $installErrorType
+                -ValidationId $ValidationId -TaskName $TaskName -Attempt $attempt -InstallErrorType $installErrorType `
+                -SecureDirectory $secureDirectory -AccountSid $accountSid -Definition $definition
             if (-not $compensation.unregister_succeeded) {
                 throw "Registration compensation left orphan $TaskName; install=$installErrorType; cleanup=$($compensation.cleanup_error_type)"
             }
@@ -1185,28 +1277,78 @@ function Remove-Phase0ScheduledTask {
     $pending = @($schedules | Where-Object { -not $_.final })
     if ($pending.Count -gt 1) { throw 'Only one uncollected scheduled task is allowed per campaign' }
     $TaskName = "UmiOcrPhase0-$ValidationId"
+    $sourceRecord = $null; $sourceSchedule = $null; $orphanCleanup = $false
+    if ($schedules.Count -gt 0) {
+        $sourceSchedule = if ($pending.Count -eq 1) { $pending[0] } else {
+            @($schedules | Sort-Object { [int]$_.metadata.install_attempt } -Descending)[0]
+        }
+        $sourceRecord = [pscustomobject]@{
+            relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $PackageRoot -Path $sourceSchedule.metadata_path
+            value = $sourceSchedule.metadata
+        }
+    }
+    else {
+        $compensations = @(Get-Phase0InstallCompensationRecords -PackageRoot $PackageRoot -CampaignId $CampaignId | Where-Object {
+            $_.value.validation_id -eq $ValidationId -and $_.value.task_name -eq $TaskName -and $_.value.orphaned_task -eq $true
+        })
+        if ($compensations.Count -ne 1) { throw 'Expected exactly one trusted orphan compensation record' }
+        $sourceRecord = $compensations[0]; $orphanCleanup = $true
+        if ($sourceRecord.value.orphaned_task -ne $true) { throw 'Trusted compensation record does not describe an orphaned task' }
+    }
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($null -eq $task) { throw 'No scheduled task exists for explicit cleanup' }
-    if ([string]$task.State -in @('Running', 'Queued')) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-    }
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-    if ($schedules.Count -lt 1) {
-        $attempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId
-        $record = [ordered]@{
-            schema_version = '1.0'; campaign_id = $CampaignId; validation_id = $ValidationId
-            cleanup_attempt = [int]$attempt.number; task_name = $TaskName
-            recorded_at_utc = [DateTime]::UtcNow.ToString('o'); lifecycle_status = 'terminal-cleaned-orphan'
+    $taskXml = Export-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    $taskXmlSha256 = Get-Phase0TextSha256 -Text $taskXml
+    if ($orphanCleanup) {
+        if (-not (Test-Phase0CompensatedTaskXml -PackageRoot $PackageRoot -Compensation $sourceRecord -TaskXml $taskXml)) {
+            throw 'Orphaned task does not match its trusted compensation record'
         }
-        $path = Write-Phase0SchedulerJson -PackageRoot $PackageRoot `
-            -Path (Join-Path $attempt.root 'scheduled-orphan-cleanup.json') -Value $record
-        return [pscustomobject]@{ validation_id = $ValidationId; lifecycle_status = 'terminal-cleaned-orphan'; final = $true; path = $path }
+    }
+    elseif (-not (Test-Phase0InstalledTaskXml -PackageRoot $PackageRoot -Metadata $sourceSchedule.metadata -TaskXml $taskXml)) {
+        throw 'Scheduled task does not match its durable install metadata'
+    }
+    $cleanupAttempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId
+    $intent = [ordered]@{
+        schema_version = '1.0'; campaign_id = $CampaignId; validation_id = $ValidationId
+        cleanup_attempt = [int]$cleanupAttempt.number; task_name = $TaskName
+        recorded_at_utc = [DateTime]::UtcNow.ToString('o'); lifecycle_status = 'cleanup-intent'
+        source_record_relative = $sourceRecord.relative; task_xml_sha256 = $taskXmlSha256
+    }
+    $intentPath = Write-Phase0SchedulerJson -PackageRoot $PackageRoot `
+        -Path (Join-Path $cleanupAttempt.root 'scheduled-cleanup-intent.json') -Value $intent
+    $intentRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $PackageRoot -Path $intentPath
+    $stopSucceeded = $true; $unregisterSucceeded = $false
+    $stopErrorType = $null; $unregisterErrorType = $null
+    if ([string]$task.State -in @('Running', 'Queued')) {
+        try { Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+        catch { $stopSucceeded = $false; $stopErrorType = $_.Exception.GetType().FullName }
+    }
+    try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop; $unregisterSucceeded = $true }
+    catch { $unregisterErrorType = $_.Exception.GetType().FullName }
+    $outcome = [ordered]@{
+        schema_version = '1.0'; campaign_id = $CampaignId; validation_id = $ValidationId
+        cleanup_attempt = [int]$cleanupAttempt.number; task_name = $TaskName
+        recorded_at_utc = [DateTime]::UtcNow.ToString('o')
+        lifecycle_status = if ($stopSucceeded -and $unregisterSucceeded) { 'terminal-cleaned' } else { 'cleanup-failed' }
+        intent_relative = $intentRelative; source_record_relative = $sourceRecord.relative
+        task_xml_sha256 = $taskXmlSha256; stop_succeeded = $stopSucceeded
+        unregister_succeeded = $unregisterSucceeded; stop_error_type = $stopErrorType
+        unregister_error_type = $unregisterErrorType
+    }
+    $outcomePath = Write-Phase0SchedulerJson -PackageRoot $PackageRoot `
+        -Path (Join-Path $cleanupAttempt.root 'scheduled-cleanup-outcome.json') -Value $outcome
+    if (-not $stopSucceeded -or -not $unregisterSucceeded) {
+        throw "Scheduled cleanup failed for $TaskName; stop=$stopErrorType; unregister=$unregisterErrorType"
+    }
+    if ($orphanCleanup) {
+        return [pscustomobject]@{ validation_id = $ValidationId; lifecycle_status = 'terminal-cleaned-orphan'; final = $true; path = $outcomePath }
     }
     if ($pending.Count -eq 1) {
         try {
             return Publish-Phase0ScheduledCollection -PackageRoot $PackageRoot -CampaignId $CampaignId -Schedule $pending[0] `
                 -Passed $false -Final $true -LastTaskResult -1 -ValidationErrorCode 'SCHEDULED_TASK_CLEANED' `
-                -TaskDefinitionValid $false -Configuration $null -LifecycleStatus 'terminal-cleaned' -ThrowOnFailure $false
+                -TaskDefinitionValid $false -Configuration $null -Attempt $cleanupAttempt `
+                -LifecycleStatus 'terminal-cleaned' -ThrowOnFailure $false
         }
         catch {
             $null = Move-Phase0InstallMetadataToTerminal -Schedule $pending[0] -Reason 'cleaned'

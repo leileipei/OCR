@@ -379,8 +379,42 @@ def test_post_registration_failures_share_compensation_boundary_and_orphan_clean
     assert "cleanup_error_type" in text
     assert "Stop-ScheduledTask" in text
     assert "Unregister-ScheduledTask" in text
-    assert "scheduled-orphan-cleanup.json" in cleanup
+    assert "scheduled-cleanup-intent.json" in cleanup
+    assert "scheduled-cleanup-outcome.json" in cleanup
     assert "Get-ScheduledTask -TaskName $TaskName" in cleanup
+
+
+def test_cleanup_requires_owned_record_and_audits_before_external_changes():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    cleanup = text.split("function Remove-Phase0ScheduledTask", 1)[1].split(
+        "Export-ModuleMember", 1
+    )[0]
+    assert "Get-Phase0InstallCompensationRecords" in text
+    assert "Test-Phase0CompensatedTaskXml" in text
+    assert "orphaned_task -ne $true" in text
+    assert "Expected exactly one trusted orphan compensation record" in text
+    assert "scheduled-cleanup-intent.json" in cleanup
+    assert "scheduled-cleanup-outcome.json" in cleanup
+    assert "source_record_relative" in cleanup
+    assert "task_xml_sha256" in cleanup
+    assert cleanup.index("scheduled-cleanup-intent.json") < cleanup.index("Stop-ScheduledTask")
+    assert cleanup.index("Stop-ScheduledTask") < cleanup.index("scheduled-cleanup-outcome.json")
+    assert "stop_error_type" in cleanup
+    assert "unregister_error_type" in cleanup
+    assert "Export-ScheduledTask" in cleanup
+
+
+def test_install_exposes_scoped_fault_hooks_inside_real_registration_boundary():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    install = text.split("function Install-Phase0ScheduledTask", 1)[1].split(
+        "function Test-Phase0InstalledTaskXml", 1
+    )[0]
+    assert "[ValidateSet('', 'Export', 'Xml', 'Metadata')]" in install
+    assert "$FaultInjection -eq 'Export'" in install
+    assert "$FaultInjection -eq 'Xml'" in install
+    assert "$FaultInjection -eq 'Metadata'" in install
+    assert install.index("$registered = $true") < install.index("$FaultInjection -eq 'Export'")
+    assert install.index("$FaultInjection -eq 'Metadata'") < install.index("$metadataDurable = $true")
 
 
 def test_scheduled_credentials_and_runner_reject_effective_administrator_tokens():
@@ -502,6 +536,15 @@ try {{
     $sid = $user.SID
     $credential = New-Object System.Management.Automation.PSCredential(".\$userName", $password)
 $module = Import-Module '{SCHEDULER}' -Force -PassThru
+    try {{
+        $null = & $module {{
+            $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+            Assert-Phase0CurrentScheduledIdentityNonAdministrator -ExpectedSid $currentSid
+        }}
+        throw 'administrator runner token was accepted'
+    }} catch {{
+        if ($_.Exception.Message -eq 'administrator runner token was accepted') {{ throw }}
+    }}
     $paths = & $module {{
         param([string]$Root, $Sid)
         $attemptPath = Join-Path $Root 'attempt'
@@ -596,41 +639,77 @@ def test_registration_compensation_removes_fault_injected_tasks_on_windows():
         pytest.skip("Task Scheduler compensation requires a Windows host")
     script = rf"""
 if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {{ exit 77 }}
+$userName = 'UmiComp' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $root = Join-Path $env:ProgramData ('UmiOcrCompensationTest-' + [guid]::NewGuid().ToString('N'))
-$module = Import-Module '{SCHEDULER}' -Force -PassThru
+$createdUser = $false
 $createdTasks = @()
 try {{
+    if (-not (Get-Command New-LocalUser -ErrorAction SilentlyContinue)) {{ exit 77 }}
+    $null = New-Item -ItemType Directory -Path $root
+    $runner = Join-Path $root 'run-windows-validation.ps1'
+    [System.IO.File]::WriteAllText($runner, "exit 0`n", (New-Object System.Text.UTF8Encoding($false)))
+    $password = ConvertTo-SecureString ('Umi!' + [guid]::NewGuid().ToString('N') + '9a') -AsPlainText -Force
+    $user = New-LocalUser -Name $userName -Password $password -PasswordNeverExpires -UserMayNotChangePassword
+    $createdUser = $true
+    $credential = New-Object System.Management.Automation.PSCredential(".\$userName", $password)
+    $module = Import-Module '{SCHEDULER}' -Force -PassThru
+    & $module {{
+        param([string]$Runner)
+        $script:CompensationTestRunner = $Runner
+        function Get-Phase0State {{
+            [pscustomobject]@{{ state = 'INTERACTIVE_OCR_PASSED'; interactive_validation_id = 'interactive-source' }}
+        }}
+        function Get-Phase0ScheduleRecords {{ @() }}
+        function Get-Phase0AttemptContext {{
+            param([string]$PackageRoot, [string]$CampaignId)
+            $attemptRoot = Join-Path $PackageRoot ("work\campaigns\$CampaignId\attempts\attempt-" + ('{{0:D4}}' -f $script:CompensationTestAttempt))
+            $null = New-Item -ItemType Directory -Path $attemptRoot -Force
+            [pscustomobject]@{{ root = $attemptRoot; number = $script:CompensationTestAttempt }}
+        }}
+        function Get-Phase0RunnerConfiguration {{
+            [ordered]@{{ schema_version = '1.0'; execution_mode = 'Scheduled'; test_only = $true }}
+        }}
+        function Assert-Phase0RunnerConfiguration {{ param($PackageRoot, $Configuration) $Configuration }}
+        function Get-Phase0RunnerScript {{ param($PackageRoot) $script:CompensationTestRunner }}
+        function Test-Phase0InstalledTaskXml {{ $true }}
+    }} $runner
     foreach ($definition in @(
-        [pscustomobject]@{{ number = 1; stage = 'ExportScheduledTaskException' }},
-        [pscustomobject]@{{ number = 2; stage = 'TaskXmlMismatchException' }},
-        [pscustomobject]@{{ number = 3; stage = 'MetadataPublishException' }}
+        [pscustomobject]@{{ number = 1; stage = 'Export' }},
+        [pscustomobject]@{{ number = 2; stage = 'Xml' }},
+        [pscustomobject]@{{ number = 3; stage = 'Metadata' }}
     )) {{
         $campaign = 'campaign-compensation'
         $validation = 'fault-' + $definition.number
         $taskName = 'UmiOcrPhase0-' + $validation
-        $attemptRoot = Join-Path $root ("work\campaigns\$campaign\attempts\attempt-" + ('{{0:D4}}' -f $definition.number))
-        $null = New-Item -ItemType Directory -Path $attemptRoot -Force
-        $attempt = [pscustomobject]@{{ root = $attemptRoot; number = $definition.number }}
-        $action = New-ScheduledTaskAction -Execute $env:ComSpec -Argument '/d /c exit 0'
-        Register-ScheduledTask -TaskName $taskName -Action $action -User 'SYSTEM' -RunLevel Highest | Out-Null
         $createdTasks += $taskName
-        $record = & $module {{
-            param($Root, $Campaign, $Validation, $TaskName, $Attempt, $ErrorType)
-            Invoke-Phase0RegistrationCompensation -PackageRoot $Root -CampaignId $Campaign `
-                -ValidationId $Validation -TaskName $TaskName -Attempt $Attempt -InstallErrorType $ErrorType
-        }} $root $campaign $validation $taskName $attempt $definition.stage
+        & $module {{ param([int]$Number) $script:CompensationTestAttempt = $Number }} $definition.number
+        try {{
+            Install-Phase0ScheduledTask -PackageRoot $root -CampaignId $campaign -ValidationId $validation `
+                -Credential $credential -FaultInjection $definition.stage
+            throw 'fault injection unexpectedly completed'
+        }} catch {{
+            if ($_.Exception.Message -eq 'fault injection unexpectedly completed') {{ throw }}
+        }}
         if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {{ throw 'fault left an orphan task' }}
-        if (-not $record.unregister_succeeded -or $record.install_error_type -ne $definition.stage) {{
+        $attemptRoot = Join-Path $root ("work\campaigns\$campaign\attempts\attempt-" + ('{{0:D4}}' -f $definition.number))
+        $path = Join-Path $attemptRoot ("secure\schedule-$validation\scheduled-install-compensation.json")
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ throw 'compensation record is missing' }}
+        $record = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if (-not $record.unregister_succeeded -or $record.orphaned_task -or
+            $record.validation_id -ne $validation -or $record.install_attempt -ne $definition.number) {{
             throw 'compensation record did not bind the injected stage'
         }}
-        $path = Join-Path $attemptRoot 'scheduled-install-compensation.json'
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ throw 'compensation record is missing' }}
     }}
+}}
+catch {{
+    if (-not $createdUser) {{ exit 77 }}
+    throw
 }}
 finally {{
     foreach ($taskName in $createdTasks) {{
         Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
     }}
+    if ($createdUser) {{ Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue }}
     if (Test-Path -LiteralPath $root) {{ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }}
 }}
 """
@@ -641,7 +720,7 @@ finally {{
         text=True,
     )
     if result.returncode == 77:
-        pytest.skip("Windows host does not expose ScheduledTasks cmdlets")
+        pytest.skip("Windows host cannot provision the scheduled-task test account")
     assert result.returncode == 0, result.stderr
 
 
