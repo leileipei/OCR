@@ -7,6 +7,7 @@ import fitz
 import pytest
 from PIL import Image, ImageDraw
 
+import umi_web_spike.cli as cli_module
 from umi_web_spike.cli import main
 
 
@@ -19,6 +20,11 @@ REQUIRED_CATEGORIES = {
     "corrupt_pdf",
     "encrypted_pdf",
 }
+
+
+@pytest.fixture(autouse=True)
+def _scheduled_windows_session(monkeypatch):
+    monkeypatch.setattr(cli_module, "_windows_session_id", lambda: 0)
 
 
 def _image(path, text):
@@ -55,6 +61,7 @@ def _validation_args(
     scanned_pages=1,
     scanned_native_text=False,
     business_concurrency_limit=5,
+    execution_mode="scheduled",
 ):
     samples = tmp_path / "samples"
     samples.mkdir()
@@ -108,6 +115,8 @@ def _validation_args(
         str(manifest),
         "--output-dir",
         str(output),
+        "--execution-mode",
+        execution_mode,
         "--min-pages",
         str(min_pages),
         "--business-concurrency-limit",
@@ -135,6 +144,8 @@ def test_validate_ocr_publishes_complete_unique_atomic_evidence(tmp_path, monkey
     assert all(item["schema_version"] == "1.0" for item in evidence)
     assert all(item["validation_id"] == manifest["validation_id"] for item in evidence)
     assert all(item["recorded_at_utc"].endswith("Z") for item in evidence)
+    assert all(item["execution_mode"] == "scheduled" for item in evidence)
+    assert manifest["execution_mode"] == "scheduled"
     assert all(item["plugin"]["name"] == "fake_ocr_plugin" for item in evidence)
     assert all(Path(item["plugin"]["root"]).is_absolute() for item in evidence)
     assert all(item["interpreter"]["executable"] == sys.executable for item in evidence)
@@ -173,6 +184,37 @@ def test_validate_ocr_publishes_complete_unique_atomic_evidence(tmp_path, monkey
     assert details["worker_calculation_basis"] == "recommended_workers=min(memory_worker_limit,cpu_worker_limit,business_concurrency_limit); memory_worker_limit=max(1,floor(memory_budget_bytes/observed_peak_process_tree_rss_bytes)); cpu_worker_limit=max(1,floor(logical_cpu_count/2))"
     assert details["qt_loaded"] is False
     assert details["interactive_session"] is False
+    assert details["headless"] is True
+    assert details["windows_session_id"] == 0
+
+
+def test_interactive_validation_requires_positive_windows_session_id(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli_module, "_windows_session_id", lambda: 3)
+    output, args = _validation_args(tmp_path, execution_mode="interactive")
+
+    assert main(args) == 0
+
+    resources = _read(output, "resources.json")
+    assert resources["execution_mode"] == "interactive"
+    assert resources["details"]["windows_session_id"] == 3
+    assert resources["details"]["interactive_session"] is True
+    assert resources["details"]["headless"] is False
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "session_id"),
+    [("interactive", 0), ("scheduled", 2)],
+)
+def test_execution_mode_rejects_wrong_windows_session(
+    tmp_path, monkeypatch, execution_mode, session_id
+):
+    monkeypatch.setattr(cli_module, "_windows_session_id", lambda: session_id)
+    output, args = _validation_args(tmp_path, execution_mode=execution_mode)
+
+    assert main(args) == 1
+    assert _read(output, "resources.json")["ok"] is False
 
 
 @pytest.mark.parametrize("with_old_file", [False, True])

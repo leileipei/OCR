@@ -1,6 +1,7 @@
 from __future__ import print_function
 
 import argparse
+import ctypes
 import json
 import os
 import platform
@@ -44,6 +45,18 @@ IMAGE_CATEGORIES = {"simplified_chinese_image", "mixed_chinese_english_image"}
 PDF_CATEGORIES = set(EXPECTED_OUTCOMES) - IMAGE_CATEGORIES
 CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 LATIN_PATTERN = re.compile(r"[A-Za-z]")
+
+
+def _windows_session_id() -> int:
+    if os.name != "nt":
+        raise RuntimeError("Windows Session ID is only available on Windows")
+    session_id = ctypes.c_ulong()
+    succeeded = ctypes.windll.kernel32.ProcessIdToSessionId(
+        os.getpid(), ctypes.byref(session_id)
+    )
+    if not succeeded:
+        raise OSError(ctypes.get_last_error(), "ProcessIdToSessionId failed")
+    return int(session_id.value)
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -265,11 +278,14 @@ def _run_classification_pdf(sample: Dict[str, str]) -> Dict[str, Any]:
 def _resource_result(
     common: Dict[str, Any], identity: Dict[str, Any], sampler: ProcessTreeSampler,
     started: float, processed_pages: int, minimum_pages: int, business_concurrency_limit: int,
+    execution_mode: str,
 ) -> Dict[str, Any]:
     duration = round(max(time.perf_counter() - started, 0.000001), 6)
     qt_loaded = bool(sampler.qt_processes) or any(name.startswith(("PySide", "PyQt")) for name in sys.modules)
     session_name = os.environ.get("SESSIONNAME", "")
-    interactive = session_name.lower() != "services"
+    windows_session_id = _windows_session_id()
+    interactive = windows_session_id > 0
+    headless = not qt_loaded and windows_session_id == 0
     peak = max(1, sampler.peak_rss)
     try:
         memory_budget = int(psutil.virtual_memory().available * 0.7)
@@ -297,9 +313,20 @@ def _resource_result(
         "qt_loaded": qt_loaded,
         "qt_processes": sorted(sampler.qt_processes),
         "session_name": session_name,
+        "windows_session_id": windows_session_id,
         "interactive_session": interactive,
-        "headless": not qt_loaded and not interactive,
+        "headless": headless,
     }
+    session_ok = (
+        execution_mode == "interactive"
+        and interactive
+        and windows_session_id > 0
+    ) or (
+        execution_mode == "scheduled"
+        and not interactive
+        and headless
+        and windows_session_id == 0
+    )
     ok = (
         details["observed_peak_process_tree_rss_bytes"] > 0
         and details["duration_seconds"] > 0
@@ -307,7 +334,7 @@ def _resource_result(
         and details["pages_per_minute"] > 0
         and details["sample_count"] > 0
         and not qt_loaded
-        and not interactive
+        and session_ok
     )
     return {**common, **identity, "ok": ok, "name": "resources", "details": details}
 
@@ -319,7 +346,7 @@ def _execute_validation(args: argparse.Namespace, working_dir: Path) -> bool:
     if args.business_concurrency_limit < 1:
         raise ValueError("business_concurrency_limit must be at least 1")
     recorded = utc_now()
-    common = envelope(validation_id, recorded)
+    common = {**envelope(validation_id, recorded), "execution_mode": args.execution_mode}
     identity = execution_identity(Path(args.plugin_root), args.plugin_name)
     samples = _load_samples(Path(args.samples_manifest))
     sampler = ProcessTreeSampler()
@@ -352,7 +379,7 @@ def _execute_validation(args: argparse.Namespace, working_dir: Path) -> bool:
     pdf_evidence = {**common, **identity, "ok": pdf_ok, "name": "ocr-pdf", "details": {"searchable_text": searchable_text, "samples": pdf_samples}}
     resources = _resource_result(
         common, identity, sampler, started, processed_pages, args.min_pages,
-        args.business_concurrency_limit,
+        args.business_concurrency_limit, args.execution_mode,
     )
     write_json(working_dir / "ocr-image.json", image_evidence)
     write_json(working_dir / "ocr-pdf.json", pdf_evidence)
@@ -392,6 +419,7 @@ def _validate_ocr(args: argparse.Namespace) -> int:
                 temporary / "manifest.json",
                 {
                     **envelope(validation_id, utc_now()),
+                    "execution_mode": args.execution_mode,
                     "status": "failed",
                     "diagnostic": "{}: {}".format(type(error).__name__, error),
                     "traceback": traceback.format_exc(),
@@ -427,6 +455,9 @@ def build_parser() -> argparse.ArgumentParser:
         validate.add_argument("--" + name, required=True)
     validate.add_argument("--min-pages", type=int, default=100)
     validate.add_argument("--business-concurrency-limit", type=int, default=5)
+    validate.add_argument(
+        "--execution-mode", choices=("interactive", "scheduled"), required=True
+    )
     validate.set_defaults(handler=_validate_ocr)
     report = subparsers.add_parser("build-report")
     report.add_argument("--results-dir", required=True)
