@@ -506,6 +506,21 @@ def test_scheduled_failures_and_cleanup_are_terminal_and_auditable():
     assert "-CampaignId $CampaignId" in remove_call
 
 
+def test_scheduled_collection_revalidates_evidence_tree_before_validator():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    collect = text.split("function Collect-Phase0ScheduledTask", 1)[1].split(
+        "function Remove-Phase0ScheduledTask", 1
+    )[0]
+    guard = (
+        "Assert-Phase0EvidenceTree -PackageRoot $PackageRoot "
+        "-Path $configuration.output_dir"
+    )
+    validator = "Invoke-Phase0EvidenceValidator -PackageRoot $PackageRoot"
+    assert guard in collect
+    assert validator in collect
+    assert collect.index(guard) < collect.index(validator)
+
+
 def test_post_registration_failures_share_compensation_boundary_and_orphan_cleanup():
     text = SCHEDULER.read_text(encoding="utf-8")
     install = text.split("function Install-Phase0ScheduledTask", 1)[1].split(

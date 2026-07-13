@@ -76,6 +76,49 @@ def test_validator_rejects_evidence_leaf_symlink_to_external_file(tmp_path):
     )
 
 
+def test_validator_rejects_leaf_swapped_to_symlink_after_tree_scan(
+    tmp_path, monkeypatch
+):
+    results = tmp_path / "results"
+    results.mkdir()
+    write_evidence(
+        results,
+        validation_id="run-scheduled-20260713",
+        execution_mode="scheduled",
+    )
+    victim = results / "ocr-image.json"
+    outside = tmp_path / "outside-ocr-image.json"
+    real_plain_files = evidence_validation_module._plain_files
+    swapped = False
+
+    def scan_then_swap(root):
+        nonlocal swapped
+        scanned = real_plain_files(root)
+        if not swapped:
+            victim.replace(outside)
+            try:
+                victim.symlink_to(outside)
+            except (NotImplementedError, OSError):
+                outside.replace(victim)
+                pytest.skip("symlink creation is unavailable")
+            swapped = True
+        return scanned
+
+    monkeypatch.setattr(
+        evidence_validation_module, "_plain_files", scan_then_swap
+    )
+
+    validation = validate_ocr_evidence(results, expected_mode="scheduled")
+
+    assert validation.ok is False
+    assert set(validation.errors) == {"image", "pdf", "resources", "manifest"}
+    assert any(
+        "symlink" in message or "reparse" in message or "changed" in message
+        for messages in validation.errors.values()
+        for message in messages
+    )
+
+
 def test_reusable_validator_rejects_tampered_manifest(tmp_path):
     write_evidence(
         tmp_path,

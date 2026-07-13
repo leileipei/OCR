@@ -1262,6 +1262,7 @@ function Collect-Phase0ScheduledTask {
     $validator = [pscustomobject]@{ ok = $false; code = 'ARGUMENT_OR_TASK_DEFINITION_INVALID'; windows_session_id = $null }
     if ($argumentTrusted -and $definitionValid) {
         # The validator output belongs to the fresh collection attempt, so reserve it only after terminal task state.
+        $null = Assert-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $configuration.output_dir
         $collectionAttempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId
         $validator = Invoke-Phase0EvidenceValidator -PackageRoot $PackageRoot -CampaignId $CampaignId -ValidationId $ValidationId `
             -ExpectedMode scheduled -ResultsDir $configuration.output_dir -Attempt $collectionAttempt

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,10 +13,13 @@ from .evidence import (
     SCHEMA_VERSION,
     WORKER_CALCULATION_BASIS,
     is_utc_timestamp,
-    sha256_file,
     validate_validation_id,
 )
-from .package_integrity import _plain_files
+from .package_integrity import (
+    _assert_no_reparse_chain,
+    _is_reparse_info,
+    _plain_files,
+)
 
 
 EXPECTED_OUTCOMES = {
@@ -37,6 +43,130 @@ class OcrEvidenceValidation:
     summary: Dict[str, Any]
 
 
+class _StableRegularFile:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.fd: Optional[int] = None
+        self.info = None
+
+    @staticmethod
+    def _require_regular(info, path: Path) -> None:
+        if _is_reparse_info(info) or not stat.S_ISREG(info.st_mode):
+            raise ValueError(
+                "symlink, reparse point, or non-regular file is forbidden: {}".format(
+                    path
+                )
+            )
+
+    @staticmethod
+    def _content_fingerprint(info):
+        return (
+            info.st_size,
+            getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000)),
+            getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000)),
+        )
+
+    def __enter__(self):
+        candidate = _assert_no_reparse_chain(self.path)
+        before = os.lstat(str(candidate))
+        self._require_regular(before, candidate)
+        flags = os.O_RDONLY
+        for name in ("O_BINARY", "O_CLOEXEC", "O_NOFOLLOW"):
+            flags |= getattr(os, name, 0)
+        fd = os.open(str(candidate), flags)
+        try:
+            opened = os.fstat(fd)
+            current = os.lstat(str(candidate))
+            self._require_regular(opened, candidate)
+            self._require_regular(current, candidate)
+            _assert_no_reparse_chain(candidate)
+            if not (
+                os.path.samestat(before, opened)
+                and os.path.samestat(opened, current)
+                and self._content_fingerprint(before)
+                == self._content_fingerprint(opened)
+                == self._content_fingerprint(current)
+            ):
+                raise ValueError(
+                    "file changed while it was being opened: {}".format(candidate)
+                )
+        except Exception:
+            os.close(fd)
+            raise
+        self.path = candidate
+        self.fd = fd
+        self.info = opened
+        return self
+
+    def _chunks(self):
+        if self.fd is None:
+            raise RuntimeError("stable file is not open")
+        os.lseek(self.fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(self.fd, 1024 * 1024)
+            if not chunk:
+                break
+            yield chunk
+
+    def read_bytes(self) -> bytes:
+        return b"".join(self._chunks())
+
+    def sha256(self) -> str:
+        digest = hashlib.sha256()
+        for chunk in self._chunks():
+            digest.update(chunk)
+        return digest.hexdigest()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        fd = self.fd
+        self.fd = None
+        if fd is None:
+            return False
+        try:
+            opened = os.fstat(fd)
+            current = os.lstat(str(self.path))
+            self._require_regular(opened, self.path)
+            self._require_regular(current, self.path)
+            _assert_no_reparse_chain(self.path)
+            if not (
+                os.path.samestat(self.info, opened)
+                and os.path.samestat(opened, current)
+                and self._content_fingerprint(self.info)
+                == self._content_fingerprint(opened)
+                == self._content_fingerprint(current)
+            ):
+                raise ValueError(
+                    "file changed while it was being read: {}".format(self.path)
+                )
+        finally:
+            os.close(fd)
+        return False
+
+
+def _read_stable_bytes(path: Path) -> Tuple[bytes, Any]:
+    with _StableRegularFile(path) as stable:
+        value = stable.read_bytes()
+        info = stable.info
+    return value, info
+
+
+def sha256_file(path: Path) -> str:
+    with _StableRegularFile(path) as stable:
+        return stable.sha256()
+
+
+def _assert_same_regular_path(path: Path, expected_info) -> None:
+    candidate = _assert_no_reparse_chain(path)
+    current = os.lstat(str(candidate))
+    _StableRegularFile._require_regular(current, candidate)
+    if not (
+        os.path.samestat(expected_info, current)
+        and _StableRegularFile._content_fingerprint(expected_info)
+        == _StableRegularFile._content_fingerprint(current)
+    ):
+        raise ValueError("file changed after it was read: {}".format(candidate))
+
+
 def _path_validation_failure(message: str) -> OcrEvidenceValidation:
     return OcrEvidenceValidation(
         ok=False,
@@ -50,14 +180,12 @@ def _path_validation_failure(message: str) -> OcrEvidenceValidation:
     )
 
 
-def _read_json(path: Path) -> Tuple[Dict[str, Any], List[str]]:
+def _read_json(data: bytes) -> Tuple[Dict[str, Any], List[str]]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}, ["文件不存在"]
+        value = json.loads(data.decode("utf-8"))
     except json.JSONDecodeError as error:
         return {}, ["JSON 无效：第 {} 行第 {} 列".format(error.lineno, error.colno)]
-    except (UnicodeDecodeError, OSError) as error:
+    except UnicodeDecodeError as error:
         return {}, ["文件读取失败：{}".format(error)]
     if not isinstance(value, dict):
         return {}, ["根节点必须是对象"]
@@ -373,10 +501,20 @@ def validate_ocr_evidence(
             return _path_validation_failure(
                 "evidence leaf must be a regular file: {}".format(path)
             )
+    evidence_bytes: Dict[str, bytes] = {}
+    evidence_infos = {}
+    try:
+        for source, path in paths.items():
+            evidence_bytes[source], evidence_infos[source] = _read_stable_bytes(path)
+        _, revalidated_files = _plain_files(results_dir)
+        if not set(paths.values()).issubset(set(revalidated_files)):
+            raise ValueError("required evidence leaves changed after reading")
+    except (OSError, ValueError) as error:
+        return _path_validation_failure(str(error))
     values: Dict[str, Dict[str, Any]] = {}
     errors: Dict[str, List[str]] = {}
-    for source, path in paths.items():
-        values[source], errors[source] = _read_json(path)
+    for source in paths:
+        values[source], errors[source] = _read_json(evidence_bytes[source])
         _validate_common(source, values[source], errors, expected_mode)
 
     validation_ids = {
@@ -489,7 +627,6 @@ def validate_ocr_evidence(
         )
     else:
         for name, digest in manifest_evidence.items():
-            evidence_path = results_dir / name
             if not isinstance(digest, str) or not HASH_PATTERN.fullmatch(digest):
                 _error(
                     errors,
@@ -498,10 +635,15 @@ def validate_ocr_evidence(
                 )
             else:
                 try:
-                    if (
-                        not evidence_path.is_file()
-                        or sha256_file(evidence_path) != digest
-                    ):
+                    source = {
+                        "ocr-image.json": "image",
+                        "ocr-pdf.json": "pdf",
+                        "resources.json": "resources",
+                    }[name]
+                    actual_digest = hashlib.sha256(
+                        evidence_bytes[source]
+                    ).hexdigest()
+                    if actual_digest != digest:
                         _error(
                             errors,
                             "manifest",
@@ -517,6 +659,16 @@ def validate_ocr_evidence(
                             name, error
                         ),
                     )
+
+    try:
+        _, final_files = _plain_files(results_dir)
+        if not set(paths.values()).issubset(set(final_files)):
+            raise ValueError("required evidence leaves changed before completion")
+        for source, path in paths.items():
+            _assert_same_regular_path(path, evidence_infos[source])
+    except (OSError, ValueError) as error:
+        for source in errors:
+            _error(errors, source, "结果树最终复验失败：{}".format(error))
 
     resource_details = values["resources"].get("details")
     if not isinstance(resource_details, dict):
