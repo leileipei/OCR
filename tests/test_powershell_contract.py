@@ -885,6 +885,16 @@ $module = Import-Module '{SCHEDULER}' -Force -PassThru
     $metadataHash = (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash
     $child = @"
 `$ErrorActionPreference = 'Stop'
+function Test-AccessDeniedError {{
+    param(`$ErrorRecord)
+    `$exception = `$ErrorRecord.Exception
+    while (`$null -ne `$exception) {{
+        if (`$exception -is [System.UnauthorizedAccessException] -or
+            ((`$exception.HResult -band 0xFFFF) -eq 5)) {{ return `$true }}
+        `$exception = `$exception.InnerException
+    }}
+    return `$false
+}}
 `$log = New-Object System.IO.FileStream('$($paths.logs)\probe.log', [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
 `$log.WriteByte(1); `$log.Dispose()
 `$null = [System.IO.Directory]::CreateDirectory('$($paths.output)\probe-output')
@@ -896,16 +906,16 @@ foreach (`$target in @('$($paths.arguments)', '$($paths.metadata)')) {{
             elseif (`$operation -eq 'delete') {{ [System.IO.File]::Delete(`$target) }}
             else {{ [System.IO.File]::Move(`$target, (`$target + '.moved')) }}
             exit 12
-        }} catch [System.UnauthorizedAccessException] {{ }}
+        }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
     }}
 }}
-try {{ [System.IO.Directory]::Delete('$($paths.secure)', `$true); exit 13 }} catch [System.UnauthorizedAccessException] {{ }}
+try {{ [System.IO.Directory]::Delete('$($paths.secure)', `$true); exit 13 }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
 foreach (`$rootPath in @(
     '$($paths.attempt)', '$($paths.run)', '$($paths.scheduled)',
     '$($paths.logs)', '$($paths.output)', '$($paths.temp)'
 )) {{
-    try {{ [System.IO.Directory]::Delete(`$rootPath, `$true); exit 14 }} catch [System.UnauthorizedAccessException] {{ }}
-    try {{ [System.IO.Directory]::Move(`$rootPath, (`$rootPath + '.moved')); exit 15 }} catch [System.UnauthorizedAccessException] {{ }}
+    try {{ [System.IO.Directory]::Delete(`$rootPath, `$true); exit 14 }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
+    try {{ [System.IO.Directory]::Move(`$rootPath, (`$rootPath + '.moved')); exit 15 }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
 }}
 exit 0
 "@
@@ -1066,6 +1076,9 @@ def test_credentialed_windows_probes_use_safe_system_working_directory():
     assert "$probeScript = Join-Path $root 'acl-probe.ps1'" in schedule_probe
     assert '-ArgumentList "-NoProfile -NonInteractive -File `"$probeScript`""' in schedule_probe
     assert "-EncodedCommand $encoded" not in schedule_probe
+    assert "function Test-AccessDeniedError" in schedule_probe
+    assert schedule_probe.count("if (-not (Test-AccessDeniedError `$_)) {{ throw }}") == 4
+    assert "catch [System.UnauthorizedAccessException]" not in schedule_probe
 
 
 def test_local_scheduled_account_alias_is_canonicalized_before_sid_translation():
