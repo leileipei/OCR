@@ -166,7 +166,7 @@ function New-Phase0CampaignSecurity {
     return $security
 }
 
-function Assert-Phase0CampaignSecurityPath {
+function Test-Phase0CampaignSecurityPath {
     param([Parameter(Mandatory = $true)][string]$Path, [string]$AllowedReadOnlySid = '')
     $item = Get-Item -LiteralPath $Path -Force
     if (-not $item.PSIsContainer -or
@@ -231,7 +231,7 @@ function Assert-Phase0CampaignSecurityPath {
     return $Path
 }
 
-function Ensure-Phase0ProtectedDirectory {
+function New-Phase0ProtectedDirectory {
     param(
         [Parameter(Mandatory = $true)][string]$PackageRoot,
         [Parameter(Mandatory = $true)][string]$RelativePath,
@@ -290,11 +290,11 @@ function Ensure-Phase0ProtectedDirectory {
         }
     }
     Assert-Phase0NoReparsePoint -Root $root -Candidate $target
-    $null = Assert-Phase0CampaignSecurityPath -Path $target -AllowedReadOnlySid $AllowedReadOnlySid
+    $null = Test-Phase0CampaignSecurityPath -Path $target -AllowedReadOnlySid $AllowedReadOnlySid
     return $target
 }
 
-function Assert-Phase0EvidenceTree {
+function Test-Phase0EvidenceTree {
     param(
         [Parameter(Mandatory = $true)][string]$PackageRoot,
         [Parameter(Mandatory = $true)][string]$Path
@@ -438,8 +438,8 @@ function Initialize-Phase0CampaignDirectories {
     $campaignRelative = Get-Phase0CampaignRelativePath $CampaignId
     $null = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath 'work'
     $null = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath 'work/campaigns'
-    $null = Ensure-Phase0ProtectedDirectory -PackageRoot $root -RelativePath $campaignRelative
-    $null = Ensure-Phase0ProtectedDirectory -PackageRoot $root -RelativePath "$campaignRelative/attempts"
+    $null = New-Phase0ProtectedDirectory -PackageRoot $root -RelativePath $campaignRelative
+    $null = New-Phase0ProtectedDirectory -PackageRoot $root -RelativePath "$campaignRelative/attempts"
     return Resolve-Phase0ContainedPath -Root $root -RelativePath $campaignRelative
 }
 
@@ -500,7 +500,7 @@ function Get-Phase0State {
     $campaignRoot = Resolve-Phase0ContainedPath -Root $root -RelativePath $campaignRelative
     if (Test-Path -LiteralPath $campaignRoot) {
         $null = Assert-Phase0RuntimeLeaf -PackageRoot $root -Path $campaignRoot -Expected 'Directory'
-        $null = Assert-Phase0CampaignSecurityPath -Path $campaignRoot
+        $null = Test-Phase0CampaignSecurityPath -Path $campaignRoot
     }
     $statePath = Resolve-Phase0ContainedPath -Root $root -RelativePath "$campaignRelative/state.json"
     if (-not (Test-Path -LiteralPath $statePath)) {
@@ -591,7 +591,7 @@ function Get-Phase0DiskAttemptMaximum {
     $root = Get-Phase0CanonicalRoot -PackageRoot $PackageRoot
     $campaignRelative = Get-Phase0CampaignRelativePath $CampaignId
     $attemptsRoot = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath "$campaignRelative/attempts"
-    $null = Assert-Phase0CampaignSecurityPath -Path $attemptsRoot
+    $null = Test-Phase0CampaignSecurityPath -Path $attemptsRoot
     $maximum = 0
     foreach ($item in Get-ChildItem -LiteralPath $attemptsRoot -Force) {
         if (-not $item.PSIsContainer -or
@@ -624,7 +624,7 @@ function Get-Phase0AttemptContext {
         if (Test-Path -LiteralPath $attemptRoot) {
             throw "Refusing to reuse existing attempt: $attemptRoot"
         }
-        $null = Ensure-Phase0ProtectedDirectory -PackageRoot $root -RelativePath $attemptRelative
+        $null = New-Phase0ProtectedDirectory -PackageRoot $root -RelativePath $attemptRelative
         $reservationPath = Resolve-Phase0ContainedPath -Root $root -RelativePath "$attemptRelative/attempt-reserved.json"
         $reservation = [pscustomobject][ordered]@{
             campaign_id     = $CampaignId
@@ -654,7 +654,7 @@ function Get-Phase0ExistingAttemptContext {
     $relative = "$campaignRelative/attempts/attempt-$('{0:D4}' -f $Attempt)"
     $attemptRoot = Resolve-Phase0ContainedPath -Root $root -RelativePath $relative
     $null = Assert-Phase0RuntimeLeaf -PackageRoot $root -Path $attemptRoot -Expected 'Directory'
-    $null = Assert-Phase0CampaignSecurityPath -Path $attemptRoot
+    $null = Test-Phase0CampaignSecurityPath -Path $attemptRoot
     $reservation = Resolve-Phase0ContainedPath -Root $root -RelativePath "$relative/attempt-reserved.json"
     $null = Assert-Phase0RuntimeLeaf -PackageRoot $root -Path $reservation -Expected 'File'
     $reservationValue = [System.IO.File]::ReadAllText($reservation, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -989,6 +989,6 @@ function Invoke-Phase0SelfTest {
 Export-ModuleMember -Function @(
     'Test-Phase0Package', 'Invoke-Phase0Preflight', 'Invoke-Phase0Prepare', 'Invoke-Phase0SelfTest',
     'Get-Phase0State', 'Set-Phase0State', 'Write-Phase0Failure', 'Enter-Phase0CampaignLock',
-    'Exit-Phase0CampaignLock', 'Get-Phase0AttemptContext', 'Assert-Phase0CampaignSecurityPath',
-    'Ensure-Phase0ProtectedDirectory', 'Assert-Phase0EvidenceTree'
+    'Exit-Phase0CampaignLock', 'Get-Phase0AttemptContext', 'Test-Phase0CampaignSecurityPath',
+    'New-Phase0ProtectedDirectory', 'Test-Phase0EvidenceTree'
 )

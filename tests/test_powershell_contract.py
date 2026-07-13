@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -302,7 +303,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{escaped_entry}', [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) {{ throw 'Entry script parse failed' }}
 Import-Module '{escaped_package}' -Force
-function Assert-Phase0CampaignSecurityPath {{ param([string]$Path) return $Path }}
+function Test-Phase0CampaignSecurityPath {{ param([string]$Path) return $Path }}
 $required = @('Assert-Phase0EntryIdentifier', 'Assert-Phase0EntryControlledPath', 'Get-Phase0EntryResultsDirectory')
 $definitions = $ast.FindAll({{
     param($node)
@@ -512,7 +513,7 @@ def test_scheduled_collection_revalidates_evidence_tree_before_validator():
         "function Remove-Phase0ScheduledTask", 1
     )[0]
     guard = (
-        "Assert-Phase0EvidenceTree -PackageRoot $PackageRoot "
+        "Test-Phase0EvidenceTree -PackageRoot $PackageRoot "
         "-Path $configuration.output_dir"
     )
     validator = "Invoke-Phase0EvidenceValidator -PackageRoot $PackageRoot"
@@ -689,17 +690,17 @@ def test_windows_runner_binds_campaign_mode_and_separate_output_directories():
 def test_campaign_evidence_directories_use_protected_fail_closed_acl_contract():
     package = PACKAGE.read_text(encoding="utf-8")
     entry = ENTRY.read_text(encoding="utf-8")
-    creator = package.split("function Ensure-Phase0ProtectedDirectory", 1)[1].split(
-        "function Assert-Phase0EvidenceTree", 1
+    creator = package.split("function New-Phase0ProtectedDirectory", 1)[1].split(
+        "function Test-Phase0EvidenceTree", 1
     )[0]
     assert "function New-Phase0CampaignSecurity" in package
     assert "SetAccessRuleProtection($true, $false)" in package
-    assert "function Assert-Phase0CampaignSecurityPath" in package
+    assert "function Test-Phase0CampaignSecurityPath" in package
     assert "Campaign ACL inheritance must be disabled" in package
     assert "Campaign owner is not trusted" in package
-    assert "Ensure-Phase0ProtectedDirectory" in package
-    assert "Assert-Phase0CampaignSecurityPath" in entry
-    assert "Assert-Phase0CampaignSecurityPath -Path $attemptsRoot" in entry
+    assert "New-Phase0ProtectedDirectory" in package
+    assert "Test-Phase0CampaignSecurityPath" in entry
+    assert "Test-Phase0CampaignSecurityPath -Path $attemptsRoot" in entry
     assert "$PSVersionTable.PSEdition -eq 'Desktop'" in creator
     assert "$PSVersionTable.PSEdition -eq 'Core'" in creator
     assert "(New-Object System.IO.DirectoryInfo($target)).Create($security)" in creator
@@ -709,6 +710,30 @@ def test_campaign_evidence_directories_use_protected_fail_closed_acl_contract():
     assert "Unsupported PowerShell edition for protected ACL creation" in creator
     assert "[System.IO.Directory]::CreateDirectory($target, $security)" not in creator
     assert "Set-Acl" not in creator
+
+
+def test_package_exports_only_approved_verbs_without_hiding_import_warnings():
+    package = PACKAGE.read_text(encoding="utf-8")
+    entry = ENTRY.read_text(encoding="utf-8")
+    scheduler = SCHEDULER.read_text(encoding="utf-8")
+    exports = package.split("Export-ModuleMember -Function @(", 1)[1]
+    names = re.findall(r"'([A-Za-z]+-Phase0[A-Za-z]+)'", exports)
+    approved_verbs = {"Test", "Invoke", "Get", "Set", "Write", "Enter", "Exit", "New"}
+    assert names
+    assert all(name.split("-", 1)[0] in approved_verbs for name in names)
+    for old_name in (
+        "Assert-Phase0CampaignSecurityPath",
+        "Ensure-Phase0ProtectedDirectory",
+        "Assert-Phase0EvidenceTree",
+    ):
+        assert old_name not in exports
+    for new_name in (
+        "Test-Phase0CampaignSecurityPath",
+        "New-Phase0ProtectedDirectory",
+        "Test-Phase0EvidenceTree",
+    ):
+        assert new_name in exports
+    assert "DisableNameChecking" not in package + entry + scheduler
 
 
 @pytest.mark.parametrize("engine_name", ["powershell", "pwsh"])
@@ -735,7 +760,7 @@ try {{
     $attempt = Get-Phase0AttemptContext -PackageRoot $root -CampaignId 'campaign-acl-proof'
     $evidence = Join-Path $attempt.root 'full-ocr-text.json'
     [System.IO.File]::WriteAllText($evidence, '{{"ocr_text":"sensitive"}}')
-    $null = & $module {{ param($Path) Assert-Phase0CampaignSecurityPath -Path $Path }} $attempt.root
+    $null = & $module {{ param($Path) Test-Phase0CampaignSecurityPath -Path $Path }} $attempt.root
     if ([System.IO.File]::ReadAllText($evidence) -notmatch 'sensitive') {{ throw 'administrator could not read evidence' }}
     $child = @"
 try {{ [System.IO.File]::ReadAllText('$evidence') | Out-Null; exit 12 }}
@@ -770,9 +795,9 @@ finally {{
 def test_collection_entry_requires_plain_evidence_tree_contract():
     package = PACKAGE.read_text(encoding="utf-8")
     entry = ENTRY.read_text(encoding="utf-8")
-    assert "function Assert-Phase0EvidenceTree" in package
+    assert "function Test-Phase0EvidenceTree" in package
     assert "Evidence tree contains a reparse point:" in package
-    assert "Assert-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $candidate" in entry
+    assert "Test-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $candidate" in entry
 
 
 def test_collection_rejects_windows_junction_in_evidence_tree(tmp_path):
@@ -795,7 +820,7 @@ def test_collection_rejects_windows_junction_in_evidence_tree(tmp_path):
     script = (
         f"Import-Module '{PACKAGE}' -Force; "
         + _powershell_expected_rejection(
-            f"Assert-Phase0EvidenceTree -PackageRoot '{package_root}' -Path '{results}'",
+            f"Test-Phase0EvidenceTree -PackageRoot '{package_root}' -Path '{results}'",
             "Evidence tree contains a reparse point:",
             message_prefix=True,
         )

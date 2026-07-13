@@ -94,7 +94,7 @@ function Get-Phase0EntryResultsDirectory {
     Assert-Phase0EntryIdentifier -Value $ValidationId -Name 'ValidationId'
     $attemptsRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId/attempts"
     $null = Assert-Phase0EntryControlledPath -ControlledRoot $PackageRoot -Path $attemptsRoot -Expected Directory
-    $null = Assert-Phase0CampaignSecurityPath -Path $attemptsRoot
+    $null = Test-Phase0CampaignSecurityPath -Path $attemptsRoot
     $resultDirectories = @()
     foreach ($directory in Get-ChildItem -LiteralPath $attemptsRoot -Force) {
         if (-not $directory.PSIsContainer -or $directory.Name -notmatch '^attempt-([0-9]{4,10})$' -or
@@ -126,7 +126,7 @@ function Get-Phase0EntryResultsDirectory {
         $resultRoot = Join-Path $attemptsRoot ('attempt-{0:D4}' -f $resultAttempt)
         $candidate = Join-Path $resultRoot $relative
         $candidate = Assert-Phase0EntryControlledPath -ControlledRoot $attemptsRoot -Path $candidate -Expected Directory
-        $null = Assert-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $candidate
+        $null = Test-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $candidate
         $resultDirectories += $candidate
     }
     if ($resultDirectories.Count -ne 1) {
@@ -155,7 +155,7 @@ try {
     }
     $campaignSecurityRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId"
     if (Test-Path -LiteralPath $campaignSecurityRoot -PathType Container) {
-        $null = Assert-Phase0CampaignSecurityPath -Path $campaignSecurityRoot
+        $null = Test-Phase0CampaignSecurityPath -Path $campaignSecurityRoot
     }
 
     switch ($Action) {
@@ -192,7 +192,7 @@ try {
                 -ValidationId $ScheduledId -ExecutionMode scheduled
             $attempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId
             $exportRelative = "$($attempt.relative)/export"
-            $exportDir = Ensure-Phase0ProtectedDirectory -PackageRoot $PackageRoot -RelativePath $exportRelative
+            $exportDir = New-Phase0ProtectedDirectory -PackageRoot $PackageRoot -RelativePath $exportRelative
             $readinessPath = Join-Path $exportDir 'ocr-readiness.md'
             $reviewBundlePath = Join-Path $exportDir 'review-bundle.zip'
             $portablePython = Join-Path $PackageRoot 'runtime/python/python.exe'
@@ -210,10 +210,10 @@ try {
             finally { $env:PYTHONPATH = $originalPythonPath }
             $campaignRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId"
             foreach ($name in @('e10', 'reports')) {
-                $path = Ensure-Phase0ProtectedDirectory -PackageRoot $PackageRoot `
+                $path = New-Phase0ProtectedDirectory -PackageRoot $PackageRoot `
                     -RelativePath "work/campaigns/$CampaignId/$name"
                 $null = Assert-Phase0EntryControlledPath -ControlledRoot $campaignRoot -Path $path -Expected Directory
-                $null = Assert-Phase0CampaignSecurityPath -Path $path
+                $null = Test-Phase0CampaignSecurityPath -Path $path
             }
             $relative = "$($attempt.relative)/export/review-bundle.zip"
             $null = Set-Phase0State -PackageRoot $PackageRoot -CampaignId $CampaignId `
@@ -230,7 +230,7 @@ try {
             $campaignRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId"
             $controlledE10Root = Join-Path $campaignRoot 'e10'
             $null = Assert-Phase0EntryControlledPath -ControlledRoot $campaignRoot -Path $controlledE10Root -Expected Directory
-            $null = Assert-Phase0CampaignSecurityPath -Path $controlledE10Root
+            $null = Test-Phase0CampaignSecurityPath -Path $controlledE10Root
             $E10EvidencePath = Assert-Phase0EntryControlledPath -ControlledRoot $controlledE10Root -Path $E10EvidencePath -Expected File
             $portablePython = Join-Path $PackageRoot 'runtime/python/python.exe'
             $projectRoot = Get-Phase0EntryProjectRoot -PackageRoot $PackageRoot
@@ -273,8 +273,8 @@ Path(evidence.official_document_path).resolve(strict=True).relative_to(controlle
             $controlledReportsRoot = Join-Path $campaignRoot 'reports'
             $null = Assert-Phase0EntryControlledPath -ControlledRoot $campaignRoot -Path $controlledE10Root -Expected Directory
             $null = Assert-Phase0EntryControlledPath -ControlledRoot $campaignRoot -Path $controlledReportsRoot -Expected Directory
-            $null = Assert-Phase0CampaignSecurityPath -Path $controlledE10Root
-            $null = Assert-Phase0CampaignSecurityPath -Path $controlledReportsRoot
+            $null = Test-Phase0CampaignSecurityPath -Path $controlledE10Root
+            $null = Test-Phase0CampaignSecurityPath -Path $controlledReportsRoot
             $E10EvidencePath = Assert-Phase0EntryControlledPath -ControlledRoot $controlledE10Root -Path $E10EvidencePath -Expected MissingOrFile
             $FinalReportPath = Assert-Phase0EntryControlledPath -ControlledRoot $controlledReportsRoot -Path $FinalReportPath -Expected MissingOrFile
             if (Test-Path -LiteralPath $FinalReportPath) { throw 'Final report output already exists' }
@@ -298,7 +298,7 @@ Path(evidence.official_document_path).resolve(strict=True).relative_to(controlle
             $expectedScheduledResults = Get-Phase0EntryResultsDirectory -PackageRoot $PackageRoot -CampaignId $CampaignId `
                 -ValidationId $state.scheduled_validation_id -ExecutionMode scheduled
             $ScheduledResultsDir = Assert-Phase0EntryControlledPath -ControlledRoot $campaignRoot -Path $ScheduledResultsDir -Expected Directory
-            $null = Assert-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $ScheduledResultsDir
+            $null = Test-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $ScheduledResultsDir
             if (-not $ScheduledResultsDir.Equals($expectedScheduledResults, [System.StringComparison]::OrdinalIgnoreCase)) {
                 throw 'ScheduledResultsDir does not match the campaign scheduled validation'
             }
