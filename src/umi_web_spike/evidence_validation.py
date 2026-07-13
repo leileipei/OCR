@@ -13,6 +13,7 @@ from .evidence import (
     sha256_file,
     validate_validation_id,
 )
+from .package_integrity import _plain_files
 
 
 EXPECTED_OUTCOMES = {
@@ -34,6 +35,19 @@ class OcrEvidenceValidation:
     campaign_id: Optional[str]
     errors: Dict[str, Tuple[str, ...]]
     summary: Dict[str, Any]
+
+
+def _path_validation_failure(message: str) -> OcrEvidenceValidation:
+    return OcrEvidenceValidation(
+        ok=False,
+        validation_id=None,
+        campaign_id=None,
+        errors={
+            source: (message,)
+            for source in ("image", "pdf", "resources", "manifest")
+        },
+        summary={},
+    )
 
 
 def _read_json(path: Path) -> Tuple[Dict[str, Any], List[str]]:
@@ -343,13 +357,22 @@ def validate_ocr_evidence(
     if expected_mode not in EXPECTED_MODES:
         raise ValueError("expected_mode must be interactive or scheduled")
 
-    results_dir = Path(results_dir)
+    try:
+        results_dir, plain_files = _plain_files(Path(results_dir))
+    except (OSError, ValueError) as error:
+        return _path_validation_failure(str(error))
     paths = {
         "image": results_dir / "ocr-image.json",
         "pdf": results_dir / "ocr-pdf.json",
         "resources": results_dir / "resources.json",
         "manifest": results_dir / "manifest.json",
     }
+    plain_file_set = set(plain_files)
+    for path in paths.values():
+        if path not in plain_file_set:
+            return _path_validation_failure(
+                "evidence leaf must be a regular file: {}".format(path)
+            )
     values: Dict[str, Dict[str, Any]] = {}
     errors: Dict[str, List[str]] = {}
     for source, path in paths.items():

@@ -1,10 +1,18 @@
 import json
+import os
 
 import pytest
 
 import umi_web_spike.evidence_validation as evidence_validation_module
 from tests.evidence_fixtures import write_evidence
 from umi_web_spike.evidence_validation import validate_ocr_evidence
+
+
+def _symlink_or_skip(link, target, target_is_directory=False):
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink creation is unavailable")
 
 
 def test_reusable_validator_accepts_same_evidence_as_full_report(tmp_path):
@@ -21,6 +29,51 @@ def test_reusable_validator_accepts_same_evidence_as_full_report(tmp_path):
     assert validation.campaign_id == "campaign-20260713-001"
     assert validation.summary["processed_pages"] == 100
     assert validation.summary["execution_mode"] == "scheduled"
+
+
+def test_validator_rejects_results_directory_symlink_to_external_tree(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    write_evidence(
+        outside,
+        validation_id="run-scheduled-20260713",
+        execution_mode="scheduled",
+    )
+    alias = tmp_path / "results-alias"
+    _symlink_or_skip(alias, outside, target_is_directory=True)
+
+    validation = validate_ocr_evidence(alias, expected_mode="scheduled")
+
+    assert validation.ok is False
+    assert set(validation.errors) == {"image", "pdf", "resources", "manifest"}
+    assert any(
+        "symlink" in message or "reparse" in message
+        for messages in validation.errors.values()
+        for message in messages
+    )
+
+
+def test_validator_rejects_evidence_leaf_symlink_to_external_file(tmp_path):
+    results = tmp_path / "results"
+    results.mkdir()
+    write_evidence(
+        results,
+        validation_id="run-scheduled-20260713",
+        execution_mode="scheduled",
+    )
+    outside = tmp_path / "outside-ocr-image.json"
+    outside.write_bytes((results / "ocr-image.json").read_bytes())
+    os.unlink(results / "ocr-image.json")
+    _symlink_or_skip(results / "ocr-image.json", outside)
+
+    validation = validate_ocr_evidence(results, expected_mode="scheduled")
+
+    assert validation.ok is False
+    assert any(
+        "symlink" in message or "reparse" in message
+        for messages in validation.errors.values()
+        for message in messages
+    )
 
 
 def test_reusable_validator_rejects_tampered_manifest(tmp_path):

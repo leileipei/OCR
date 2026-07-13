@@ -20,6 +20,12 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+      - name: Reject tags that do not exactly match this package version
+        shell: powershell
+        run: |
+          if ($env:GITHUB_REF_NAME -cne 'offline-v0.2.0') {
+            throw "Refusing to build or publish an unexpected offline tag: $env:GITHUB_REF_NAME"
+          }
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12.10'

@@ -138,6 +138,143 @@ function Ensure-Phase0SafeDirectory {
     return $target
 }
 
+function Get-Phase0CampaignWellKnownSids {
+    $administrators = New-Object System.Security.Principal.SecurityIdentifier(
+        [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null
+    )
+    $system = New-Object System.Security.Principal.SecurityIdentifier(
+        [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null
+    )
+    return [pscustomobject]@{ administrators = $administrators; system = $system }
+}
+
+function New-Phase0CampaignSecurity {
+    $sids = Get-Phase0CampaignWellKnownSids
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner($sids.administrators)
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    foreach ($sid in @($sids.system, $sids.administrators)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inherit,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $null = $security.AddAccessRule($rule)
+    }
+    return $security
+}
+
+function Assert-Phase0CampaignSecurityPath {
+    param([Parameter(Mandatory = $true)][string]$Path, [string]$AllowedReadOnlySid = '')
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Campaign security path is not a normal directory'
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) {
+        throw 'Campaign ACL inheritance must be disabled'
+    }
+    $sids = Get-Phase0CampaignWellKnownSids
+    try {
+        $owner = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        )
+    }
+    catch {
+        $owner = New-Object System.Security.Principal.SecurityIdentifier($acl.Owner)
+    }
+    if ($owner.Value -notin @($sids.administrators.Value, $sids.system.Value)) {
+        throw 'Campaign owner is not trusted'
+    }
+    $seenAdministrators = $false
+    $seenSystem = $false
+    $seenReadOnlySid = $false
+    $mutationMask = [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::CreateFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+        [System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [System.Security.AccessControl.FileSystemRights]::Delete -bor
+        [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.IsInherited -or
+            $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            throw 'Campaign ACL contains inherited or deny rules'
+        }
+        $sid = [string]$rule.IdentityReference.Value
+        if ($sid -eq $sids.administrators.Value -or $sid -eq $sids.system.Value) {
+            if (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne
+                [System.Security.AccessControl.FileSystemRights]::FullControl) {
+                throw 'Campaign trusted principals require full control'
+            }
+            if ($sid -eq $sids.administrators.Value) { $seenAdministrators = $true } else { $seenSystem = $true }
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($AllowedReadOnlySid) -or
+            $sid -ne $AllowedReadOnlySid -or $seenReadOnlySid -or
+            ($rule.FileSystemRights -band $mutationMask) -ne 0 -or
+            ($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) -ne
+                [System.Security.AccessControl.FileSystemRights]::ReadAndExecute) {
+            throw 'Campaign ACL contains an unauthorized identity or capability'
+        }
+        $seenReadOnlySid = $true
+    }
+    if (-not $seenAdministrators -or -not $seenSystem) {
+        throw 'Campaign ACL is incomplete'
+    }
+    return $Path
+}
+
+function Ensure-Phase0ProtectedDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [string]$AllowedReadOnlySid = ''
+    )
+    $root = Get-Phase0CanonicalRoot -PackageRoot $PackageRoot
+    $target = Resolve-Phase0ContainedPath -Root $root -RelativePath $RelativePath
+    $parent = [System.IO.Path]::GetDirectoryName($target)
+    if (-not (Test-Path -LiteralPath $parent -PathType Container)) {
+        throw "Protected directory parent is missing: $parent"
+    }
+    Assert-Phase0NoReparsePoint -Root $root -Candidate $parent
+    if ([System.IO.File]::Exists($target)) {
+        throw "Protected directory path is a file: $target"
+    }
+    if (-not [System.IO.Directory]::Exists($target)) {
+        $security = New-Phase0CampaignSecurity
+        $null = [System.IO.Directory]::CreateDirectory($target, $security)
+    }
+    Assert-Phase0NoReparsePoint -Root $root -Candidate $target
+    $null = Assert-Phase0CampaignSecurityPath -Path $target -AllowedReadOnlySid $AllowedReadOnlySid
+    return $target
+}
+
+function Assert-Phase0EvidenceTree {
+    param(
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $root = Get-Phase0CanonicalRoot -PackageRoot $PackageRoot
+    $null = Assert-Phase0RuntimeLeaf -PackageRoot $root -Path $Path -Expected 'Directory'
+    foreach ($item in Get-ChildItem -LiteralPath $Path -Recurse -Force) {
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Evidence tree contains a reparse point: $($item.FullName)"
+        }
+        if (-not $item.PSIsContainer -and
+            ($item.Attributes -band [System.IO.FileAttributes]::Device) -ne 0) {
+            throw "Evidence tree contains a non-regular file: $($item.FullName)"
+        }
+    }
+    return $Path
+}
+
 function Assert-Phase0RuntimeLeaf {
     param(
         [Parameter(Mandatory = $true)][string]$PackageRoot,
@@ -263,8 +400,8 @@ function Initialize-Phase0CampaignDirectories {
     $campaignRelative = Get-Phase0CampaignRelativePath $CampaignId
     $null = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath 'work'
     $null = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath 'work/campaigns'
-    $null = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath $campaignRelative
-    $null = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath "$campaignRelative/attempts"
+    $null = Ensure-Phase0ProtectedDirectory -PackageRoot $root -RelativePath $campaignRelative
+    $null = Ensure-Phase0ProtectedDirectory -PackageRoot $root -RelativePath "$campaignRelative/attempts"
     return Resolve-Phase0ContainedPath -Root $root -RelativePath $campaignRelative
 }
 
@@ -325,6 +462,7 @@ function Get-Phase0State {
     $campaignRoot = Resolve-Phase0ContainedPath -Root $root -RelativePath $campaignRelative
     if (Test-Path -LiteralPath $campaignRoot) {
         $null = Assert-Phase0RuntimeLeaf -PackageRoot $root -Path $campaignRoot -Expected 'Directory'
+        $null = Assert-Phase0CampaignSecurityPath -Path $campaignRoot
     }
     $statePath = Resolve-Phase0ContainedPath -Root $root -RelativePath "$campaignRelative/state.json"
     if (-not (Test-Path -LiteralPath $statePath)) {
@@ -415,6 +553,7 @@ function Get-Phase0DiskAttemptMaximum {
     $root = Get-Phase0CanonicalRoot -PackageRoot $PackageRoot
     $campaignRelative = Get-Phase0CampaignRelativePath $CampaignId
     $attemptsRoot = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath "$campaignRelative/attempts"
+    $null = Assert-Phase0CampaignSecurityPath -Path $attemptsRoot
     $maximum = 0
     foreach ($item in Get-ChildItem -LiteralPath $attemptsRoot -Force) {
         if (-not $item.PSIsContainer -or
@@ -447,7 +586,7 @@ function Get-Phase0AttemptContext {
         if (Test-Path -LiteralPath $attemptRoot) {
             throw "Refusing to reuse existing attempt: $attemptRoot"
         }
-        $null = Ensure-Phase0SafeDirectory -PackageRoot $root -RelativePath $attemptRelative
+        $null = Ensure-Phase0ProtectedDirectory -PackageRoot $root -RelativePath $attemptRelative
         $reservationPath = Resolve-Phase0ContainedPath -Root $root -RelativePath "$attemptRelative/attempt-reserved.json"
         $reservation = [pscustomobject][ordered]@{
             campaign_id     = $CampaignId
@@ -477,6 +616,7 @@ function Get-Phase0ExistingAttemptContext {
     $relative = "$campaignRelative/attempts/attempt-$('{0:D4}' -f $Attempt)"
     $attemptRoot = Resolve-Phase0ContainedPath -Root $root -RelativePath $relative
     $null = Assert-Phase0RuntimeLeaf -PackageRoot $root -Path $attemptRoot -Expected 'Directory'
+    $null = Assert-Phase0CampaignSecurityPath -Path $attemptRoot
     $reservation = Resolve-Phase0ContainedPath -Root $root -RelativePath "$relative/attempt-reserved.json"
     $null = Assert-Phase0RuntimeLeaf -PackageRoot $root -Path $reservation -Expected 'File'
     $reservationValue = [System.IO.File]::ReadAllText($reservation, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -811,5 +951,6 @@ function Invoke-Phase0SelfTest {
 Export-ModuleMember -Function @(
     'Test-Phase0Package', 'Invoke-Phase0Preflight', 'Invoke-Phase0Prepare', 'Invoke-Phase0SelfTest',
     'Get-Phase0State', 'Set-Phase0State', 'Write-Phase0Failure', 'Enter-Phase0CampaignLock',
-    'Exit-Phase0CampaignLock', 'Get-Phase0AttemptContext'
+    'Exit-Phase0CampaignLock', 'Get-Phase0AttemptContext', 'Assert-Phase0CampaignSecurityPath',
+    'Ensure-Phase0ProtectedDirectory', 'Assert-Phase0EvidenceTree'
 )

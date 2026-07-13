@@ -246,6 +246,10 @@ def test_release_workflow_builds_on_windows_and_gates_release_after_validation()
     checkout = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
     setup = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
     assert "runs-on: windows-latest" in text
+    assert "- 'offline-v*'" in text
+    guard = "if ($env:GITHUB_REF_NAME -cne 'offline-v0.2.0')"
+    assert guard in text
+    assert "Refusing to build or publish an unexpected offline tag" in text
     assert checkout in text and setup in text
     assert "- uses: {}\n        with:\n          persist-credentials: false".format(checkout) in text
     uses = re.findall(r"(?m)^\s+- uses: ([^\s]+)$", text)
@@ -273,6 +277,7 @@ def test_release_workflow_builds_on_windows_and_gates_release_after_validation()
         text,
     )
     required_order = [
+        guard,
         "python -m pytest -q",
         "scripts/build-offline-package.ps1",
         "$env:BUILT_OFFLINE_PACKAGE",

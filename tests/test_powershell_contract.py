@@ -290,6 +290,7 @@ def test_entrypoint_resolves_passed_result_directories_on_windows_powershell_51(
     )
 
     escaped_entry = str(ENTRY).replace("'", "''")
+    escaped_package = str(PACKAGE).replace("'", "''")
     escaped_root = str(package_root).replace("'", "''")
     script = rf"""
 $ErrorActionPreference = 'Stop'
@@ -300,6 +301,7 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{escaped_entry}', [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) {{ throw 'Entry script parse failed' }}
+Import-Module '{escaped_package}' -Force
 $required = @('Assert-Phase0EntryIdentifier', 'Assert-Phase0EntryControlledPath', 'Get-Phase0EntryResultsDirectory')
 $definitions = $ast.FindAll({{
     param($node)
@@ -666,6 +668,111 @@ def test_windows_runner_binds_campaign_mode_and_separate_output_directories():
     scheduler = SCHEDULER.read_text(encoding="utf-8")
     assert "| Out-Host" in scheduler
     assert "return [int]$exitCode" in scheduler
+
+
+def test_campaign_evidence_directories_use_protected_fail_closed_acl_contract():
+    package = PACKAGE.read_text(encoding="utf-8")
+    entry = ENTRY.read_text(encoding="utf-8")
+    assert "function New-Phase0CampaignSecurity" in package
+    assert "SetAccessRuleProtection($true, $false)" in package
+    assert "function Assert-Phase0CampaignSecurityPath" in package
+    assert "Campaign ACL inheritance must be disabled" in package
+    assert "Campaign owner is not trusted" in package
+    assert "Ensure-Phase0ProtectedDirectory" in package
+    assert "Assert-Phase0CampaignSecurityPath" in entry
+
+
+def test_campaign_acl_denies_unprivileged_read_and_allows_administrator_on_windows(tmp_path):
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or not powershell:
+        pytest.skip("Windows campaign ACL behavior requires a Windows host")
+    script = rf"""
+$userName = 'UmiEvidence' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$root = Join-Path $env:ProgramData ('UmiOcrEvidenceAcl-' + [guid]::NewGuid().ToString('N'))
+$createdUser = $false
+if (-not (Get-Command New-LocalUser -ErrorAction SilentlyContinue)) {{ exit 77 }}
+try {{
+    $null = New-Item -ItemType Directory -Path $root
+    $password = ConvertTo-SecureString ('Umi!' + [guid]::NewGuid().ToString('N') + '9a') -AsPlainText -Force
+    $user = New-LocalUser -Name $userName -Password $password -PasswordNeverExpires -UserMayNotChangePassword
+    $createdUser = $true
+    $credential = New-Object System.Management.Automation.PSCredential(".\$userName", $password)
+    $module = Import-Module '{PACKAGE}' -Force -PassThru
+    $attempt = Get-Phase0AttemptContext -PackageRoot $root -CampaignId 'campaign-acl-proof'
+    $evidence = Join-Path $attempt.root 'full-ocr-text.json'
+    [System.IO.File]::WriteAllText($evidence, '{{"ocr_text":"sensitive"}}')
+    $null = & $module {{ param($Path) Assert-Phase0CampaignSecurityPath -Path $Path }} $attempt.root
+    if ([System.IO.File]::ReadAllText($evidence) -notmatch 'sensitive') {{ throw 'administrator could not read evidence' }}
+    $child = @"
+try {{ [System.IO.File]::ReadAllText('$evidence') | Out-Null; exit 12 }}
+catch [System.UnauthorizedAccessException] {{ exit 0 }}
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+    $hostExecutable = (Get-Process -Id $PID).Path
+    $process = Start-Process -FilePath $hostExecutable -Credential $credential `
+        -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" -Wait -PassThru
+    if ($process.ExitCode -ne 0) {{ throw "unprivileged ACL probe failed: $($process.ExitCode)" }}
+}}
+catch {{
+    if (-not $createdUser) {{ exit 77 }}
+    throw
+}}
+finally {{
+    if ($createdUser) {{ Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue }}
+    if (Test-Path -LiteralPath $root) {{ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }}
+}}
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode == 77:
+        pytest.skip("Windows host cannot provision a temporary non-admin local account")
+    assert result.returncode == 0, result.stderr
+
+
+def test_collection_entry_requires_plain_evidence_tree_contract():
+    package = PACKAGE.read_text(encoding="utf-8")
+    entry = ENTRY.read_text(encoding="utf-8")
+    assert "function Assert-Phase0EvidenceTree" in package
+    assert "Evidence tree contains a reparse point:" in package
+    assert "Assert-Phase0EvidenceTree -PackageRoot $PackageRoot -Path $candidate" in entry
+
+
+def test_collection_rejects_windows_junction_in_evidence_tree(tmp_path):
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or not powershell:
+        pytest.skip("Windows evidence junction behavior requires a Windows host")
+    package_root = tmp_path / "package"
+    results = package_root / "work/campaigns/campaign-junction/results"
+    outside = tmp_path / "outside"
+    results.mkdir(parents=True)
+    outside.mkdir()
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(results / "redirected"), str(outside)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if linked.returncode != 0:
+        pytest.skip("The Windows test account cannot create an evidence junction")
+    script = (
+        f"Import-Module '{PACKAGE}' -Force; "
+        + _powershell_expected_rejection(
+            f"Assert-Phase0EvidenceTree -PackageRoot '{package_root}' -Path '{results}'",
+            "Evidence tree contains a reparse point:",
+            message_prefix=True,
+        )
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_restricted_schedule_acl_round_trip_with_non_admin_account_on_windows():
