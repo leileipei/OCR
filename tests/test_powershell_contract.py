@@ -769,7 +769,8 @@ catch [System.UnauthorizedAccessException] {{ exit 0 }}
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
     $hostExecutable = (Get-Process -Id $PID).Path
     $process = Start-Process -FilePath $hostExecutable -Credential $credential `
-        -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" -Wait -PassThru
+        -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" `
+        -WorkingDirectory $env:SystemRoot -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "unprivileged ACL probe failed: $($process.ExitCode)" }}
 }}
 catch {{
@@ -911,7 +912,8 @@ exit 0
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
     $hostExecutable = (Get-Process -Id $PID).Path
     $process = Start-Process -FilePath $hostExecutable -Credential $credential `
-        -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" -Wait -PassThru
+        -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" `
+        -WorkingDirectory $env:SystemRoot -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "non-admin ACL probe failed: $($process.ExitCode)" }}
     if ((Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash -ne $argumentsHash -or
         (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash -ne $metadataHash) {{
@@ -971,22 +973,22 @@ try {{
     & $module {{
         param([string]$Runner)
         $script:CompensationTestRunner = $Runner
-        function Get-Phase0State {{
+        function script:Get-Phase0State {{
             [pscustomobject]@{{ state = 'INTERACTIVE_OCR_PASSED'; interactive_validation_id = 'interactive-source' }}
         }}
-        function Get-Phase0ScheduleRecords {{ @() }}
-        function Get-Phase0AttemptContext {{
+        function script:Get-Phase0ScheduleRecords {{ @() }}
+        function script:Get-Phase0AttemptContext {{
             param([string]$PackageRoot, [string]$CampaignId)
             $attemptRoot = Join-Path $PackageRoot ("work\campaigns\$CampaignId\attempts\attempt-" + ('{{0:D4}}' -f $script:CompensationTestAttempt))
             $null = New-Item -ItemType Directory -Path $attemptRoot -Force
             [pscustomobject]@{{ root = $attemptRoot; number = $script:CompensationTestAttempt }}
         }}
-        function Get-Phase0RunnerConfiguration {{
+        function script:Get-Phase0RunnerConfiguration {{
             [ordered]@{{ schema_version = '1.0'; execution_mode = 'Scheduled'; test_only = $true }}
         }}
-        function Assert-Phase0RunnerConfiguration {{ param($PackageRoot, $Configuration) $Configuration }}
-        function Get-Phase0RunnerScript {{ param($PackageRoot) $script:CompensationTestRunner }}
-        function Test-Phase0InstalledTaskXml {{ $true }}
+        function script:Assert-Phase0RunnerConfiguration {{ param($PackageRoot, $Configuration) $Configuration }}
+        function script:Get-Phase0RunnerScript {{ param($PackageRoot) $script:CompensationTestRunner }}
+        function script:Test-Phase0InstalledTaskXml {{ $true }}
     }} $runner
     foreach ($definition in @(
         [pscustomobject]@{{ number = 1; stage = 'Export' }},
@@ -1042,6 +1044,43 @@ finally {{
     if result.returncode == 77:
         pytest.skip("Windows host cannot provision the scheduled-task test account")
     assert result.returncode == 0, result.stderr
+
+
+def test_credentialed_windows_probes_use_safe_system_working_directory():
+    source = Path(__file__).read_text(encoding="utf-8")
+    campaign_probe = source.split(
+        "\ndef test_campaign_acl_denies_unprivileged_read_and_allows_administrator_on_windows",
+        1,
+    )[1].split("\ndef test_collection_entry_requires_plain_evidence_tree_contract", 1)[0]
+    schedule_probe = source.split(
+        "\ndef test_restricted_schedule_acl_round_trip_with_non_admin_account_on_windows",
+        1,
+    )[1].split(
+        "\ndef test_registration_compensation_removes_fault_injected_tasks_on_windows", 1
+    )[0]
+    for probe in (campaign_probe, schedule_probe):
+        assert "Start-Process -FilePath $hostExecutable -Credential $credential" in probe
+        assert "-WorkingDirectory $env:SystemRoot" in probe
+
+
+def test_compensation_fault_overrides_persist_in_scheduler_module_script_scope():
+    source = Path(__file__).read_text(encoding="utf-8")
+    compensation = source.split(
+        "\ndef test_registration_compensation_removes_fault_injected_tasks_on_windows", 1
+    )[1].split(
+        "\ndef test_credentialed_windows_probes_use_safe_system_working_directory", 1
+    )[0]
+    for function_name in (
+        "Get-Phase0State",
+        "Get-Phase0ScheduleRecords",
+        "Get-Phase0AttemptContext",
+        "Get-Phase0RunnerConfiguration",
+        "Assert-Phase0RunnerConfiguration",
+        "Get-Phase0RunnerScript",
+        "Test-Phase0InstalledTaskXml",
+    ):
+        assert "function script:" + function_name + " {{" in compensation
+        assert "function " + function_name + " {{" not in compensation
 
 
 def test_task_definition_dry_run_on_windows_without_registration(tmp_path):
