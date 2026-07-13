@@ -67,6 +67,8 @@ umi-ocr-phase0-offline-rapid-v2.1.5-<tool-version>.zip
 umi-ocr-phase0/
 ├── README-现场验证.md
 ├── Start-Phase0Validation.ps1
+├── Phase0.Package.psm1
+├── Phase0.Scheduler.psm1
 ├── SHA256SUMS.txt
 ├── manifest.json
 ├── sbom.json
@@ -146,7 +148,7 @@ Release 默认保持 Draft，必须由维护者核对版本、SHA-256、许可�
 
 ## 7. 状态机与重跑
 
-每次现场验证使用唯一 `validation_id`，目录不可复用：
+一次完整现场活动使用唯一 `campaign_id`。普通 PowerShell 和计划任务是两个独立 OCR 执行，各自使用不可复用的 `validation_id`；campaign 状态文件记录两者的关联，证据目录不得复用：
 
 ```text
 NEW
@@ -160,13 +162,13 @@ NEW
   -> PHASE_0_PASSED
 ```
 
-任一步失败进入对应的 `*_FAILED` 状态，并生成诊断。重试创建新的 attempt 子目录，不覆盖旧证据。只有同一 `validation_id` 下经过哈希绑定的证据可以进入下一状态。
+任一步失败进入对应的 `*_FAILED` 状态，并生成诊断。重试创建新的 attempt 子目录，不覆盖旧证据。单次执行的证据必须共享该执行的 `validation_id`；OCR 就绪报告必须同时引用同一 campaign 下不同的 interactive 与 scheduled validation ID。
 
 `OCR_READY_E10_PENDING` 是 OCR 子阶段成功，不是完整 Phase 0 成功。`BuildFinalReport` 在 E10 缺失时必须返回非零退出码并输出停止结论。
 
 ## 8. 计划任务生命周期
 
-临时计划任务名包含验证 ID，例如：
+临时计划任务名包含 scheduled validation ID，例如：
 
 ```text
 UmiOcrPhase0-<validation_id>
