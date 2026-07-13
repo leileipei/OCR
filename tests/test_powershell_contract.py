@@ -755,7 +755,7 @@ try {{
     $password = ConvertTo-SecureString ('Umi!' + [guid]::NewGuid().ToString('N') + '9a') -AsPlainText -Force
     $user = New-LocalUser -Name $userName -Password $password -PasswordNeverExpires -UserMayNotChangePassword
     $createdUser = $true
-    $credential = New-Object System.Management.Automation.PSCredential(".\$userName", $password)
+    $credential = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$userName", $password)
     $module = Import-Module '{PACKAGE}' -Force -PassThru
     $attempt = Get-Phase0AttemptContext -PackageRoot $root -CampaignId 'campaign-acl-proof'
     $evidence = Join-Path $attempt.root 'full-ocr-text.json'
@@ -850,7 +850,7 @@ try {{
     $user = New-LocalUser -Name $userName -Password $password -PasswordNeverExpires -UserMayNotChangePassword
     $createdUser = $true
     $sid = $user.SID
-    $credential = New-Object System.Management.Automation.PSCredential(".\$userName", $password)
+    $credential = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$userName", $password)
 $module = Import-Module '{SCHEDULER}' -Force -PassThru
     try {{
         $null = & $module {{
@@ -909,10 +909,11 @@ foreach (`$rootPath in @(
 }}
 exit 0
 "@
-    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+    $probeScript = Join-Path $root 'acl-probe.ps1'
+    [System.IO.File]::WriteAllText($probeScript, $child, (New-Object System.Text.UTF8Encoding($false)))
     $hostExecutable = (Get-Process -Id $PID).Path
     $process = Start-Process -FilePath $hostExecutable -Credential $credential `
-        -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" `
+        -ArgumentList "-NoProfile -NonInteractive -File `"$probeScript`"" `
         -WorkingDirectory $env:SystemRoot -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "non-admin ACL probe failed: $($process.ExitCode)" }}
     if ((Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash -ne $argumentsHash -or
@@ -968,7 +969,7 @@ try {{
     $password = ConvertTo-SecureString ('Umi!' + [guid]::NewGuid().ToString('N') + '9a') -AsPlainText -Force
     $user = New-LocalUser -Name $userName -Password $password -PasswordNeverExpires -UserMayNotChangePassword
     $createdUser = $true
-    $credential = New-Object System.Management.Automation.PSCredential(".\$userName", $password)
+    $credential = New-Object System.Management.Automation.PSCredential("$env:COMPUTERNAME\$userName", $password)
     $module = Import-Module '{SCHEDULER}' -Force -PassThru
     & $module {{
         param([string]$Runner)
@@ -1059,8 +1060,25 @@ def test_credentialed_windows_probes_use_safe_system_working_directory():
         "\ndef test_registration_compensation_removes_fault_injected_tasks_on_windows", 1
     )[0]
     for probe in (campaign_probe, schedule_probe):
+        assert 'PSCredential("$env:COMPUTERNAME\\$userName", $password)' in probe
         assert "Start-Process -FilePath $hostExecutable -Credential $credential" in probe
         assert "-WorkingDirectory $env:SystemRoot" in probe
+    assert "$probeScript = Join-Path $root 'acl-probe.ps1'" in schedule_probe
+    assert '-ArgumentList "-NoProfile -NonInteractive -File `"$probeScript`""' in schedule_probe
+    assert "-EncodedCommand $encoded" not in schedule_probe
+
+
+def test_local_scheduled_account_alias_is_canonicalized_before_sid_translation():
+    scheduler = SCHEDULER.read_text(encoding="utf-8")
+    assert "function ConvertTo-Phase0ScheduledAccountName" in scheduler
+    assert "$Credential.UserName.StartsWith('.\\')" in scheduler
+    assert 'return "$env:COMPUTERNAME\\$localName"' in scheduler
+    install = scheduler.split("function Install-Phase0ScheduledTask", 1)[1]
+    assert (
+        "$userName = ConvertTo-Phase0ScheduledAccountName -Credential $Credential"
+        in install
+    )
+    assert "NTAccount($Credential.UserName)" not in install
 
 
 def test_compensation_fault_overrides_persist_in_scheduler_module_script_scope():

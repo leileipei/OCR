@@ -188,6 +188,17 @@ function Assert-Phase0CurrentScheduledIdentityNonAdministrator {
     finally { $identity.Dispose() }
 }
 
+function ConvertTo-Phase0ScheduledAccountName {
+    param([System.Management.Automation.PSCredential]$Credential)
+    $userName = $Credential.UserName
+    if ($Credential.UserName.StartsWith('.\')) {
+        $localName = $userName.Substring(2)
+        if ([string]::IsNullOrWhiteSpace($localName)) { throw 'Scheduled credential local account name is empty' }
+        return "$env:COMPUTERNAME\$localName"
+    }
+    return $userName
+}
+
 function New-Phase0ScheduleSecurity {
     param([System.Security.Principal.SecurityIdentifier]$AccountSid, [switch]$Directory)
     $sids = Get-Phase0WellKnownSids
@@ -1044,7 +1055,7 @@ function Install-Phase0ScheduledTask {
         return $dryRunDefinition
     }
     if ($null -eq $Credential) { $Credential = Get-Credential -Message 'Phase 0 scheduled-task account' }
-    $userName = $Credential.UserName
+    $userName = ConvertTo-Phase0ScheduledAccountName -Credential $Credential
     $accountSid = (New-Object System.Security.Principal.NTAccount($userName)).Translate([System.Security.Principal.SecurityIdentifier])
     Assert-Phase0ScheduledCredentialNonAdministrator -Credential $Credential -ExpectedSid $accountSid
     $attempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId
