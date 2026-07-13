@@ -16,6 +16,7 @@ param(
   [Parameter(Mandatory=$true, ParameterSetName='Direct')]
   [ValidateSet('Interactive', 'Scheduled')][string]$ExecutionMode,
   [Parameter(ParameterSetName='Direct')][string]$OutputDir = '',
+  [Parameter(ParameterSetName='Direct')][string]$TempDir = '',
   [Parameter(ParameterSetName='Direct')][string]$StdoutLog = '',
   [Parameter(ParameterSetName='Direct')][string]$StderrLog = '',
   [Parameter(ParameterSetName='Direct')][int]$MinPages = 100,
@@ -53,14 +54,23 @@ else {
   }
   $attemptName = 'attempt-{0:D4}' -f $Attempt
   $attemptRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId/attempts/$attemptName"
-  if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+  if ($ExecutionMode -eq 'Scheduled') {
+    if ([string]::IsNullOrWhiteSpace($OutputDir)) { $OutputDir = Join-Path $attemptRoot "run/scheduled/output/$ValidationId" }
+    if ([string]::IsNullOrWhiteSpace($TempDir)) { $TempDir = Join-Path $attemptRoot 'run/scheduled/temp' }
+    if ([string]::IsNullOrWhiteSpace($StdoutLog) -and [string]::IsNullOrWhiteSpace($StderrLog)) {
+      $StdoutLog = Join-Path $attemptRoot 'run/scheduled/logs/stdout.log'
+      $StderrLog = Join-Path $attemptRoot 'run/scheduled/logs/stderr.log'
+    }
+  }
+  elseif ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $attemptRoot ("ocr/" + $ExecutionMode.ToLowerInvariant() + "/$ValidationId")
   }
   $configuration = [pscustomobject][ordered]@{
     package_root = $PackageRoot; project_root = $ProjectRoot; umi_data_root = $UmiDataRoot
     test_python_exe = $TestPythonExe; python_exe = $PythonExe; plugin_root = $PluginRoot; plugin_name = $PluginName
     global_options = $GlobalOptions; local_options = $LocalOptions; samples_manifest = $SamplesManifest
-    validation_id = $ValidationId; campaign_id = $CampaignId; execution_mode = $ExecutionMode; output_dir = $OutputDir
+    validation_id = $ValidationId; campaign_id = $CampaignId; execution_mode = $ExecutionMode
+    output_dir = $OutputDir; temp_dir = $TempDir
     min_pages = $MinPages; business_concurrency_limit = $BusinessConcurrencyLimit
     stdout_log = $StdoutLog; stderr_log = $StderrLog; attempt = $Attempt
   }
@@ -80,6 +90,7 @@ $ValidationId = [string]$configuration.validation_id
 $CampaignId = [string]$configuration.campaign_id
 $ExecutionMode = [string]$configuration.execution_mode
 $OutputDir = [string]$configuration.output_dir
+$TempDir = [string]$configuration.temp_dir
 $MinPages = [int]$configuration.min_pages
 $BusinessConcurrencyLimit = [int]$configuration.business_concurrency_limit
 $StdoutLog = [string]$configuration.stdout_log
@@ -110,10 +121,21 @@ function Invoke-Phase0Native {
 
 $ExitCode = 1
 $OriginalPythonPath = $env:PYTHONPATH
+$OriginalTemp = $env:TEMP
+$OriginalTmp = $env:TMP
+$OriginalTmpDir = $env:TMPDIR
+$OriginalDontWriteBytecode = $env:PYTHONDONTWRITEBYTECODE
 Push-Location $ProjectRoot
 try {
+  if (-not [string]::IsNullOrWhiteSpace($TempDir)) {
+    if (-not (Test-Path -LiteralPath $TempDir -PathType Container)) { throw 'Scheduled temporary directory is missing' }
+    $env:TEMP = $TempDir
+    $env:TMP = $TempDir
+    $env:TMPDIR = $TempDir
+    $env:PYTHONDONTWRITEBYTECODE = '1'
+  }
   $env:PYTHONPATH = "$ProjectRoot\src"
-  $ExitCode = Invoke-Phase0Native -Executable $TestPythonExe -Arguments @('-m', 'pytest', '-q')
+  $ExitCode = Invoke-Phase0Native -Executable $TestPythonExe -Arguments @('-m', 'pytest', '-q', '-p', 'no:cacheprovider')
   if ($ExitCode -eq 0) {
     $env:PYTHONPATH = "$ProjectRoot\src;$UmiDataRoot\py_src\imports;$UmiDataRoot\site-packages"
     $ExitCode = Invoke-Phase0Native -Executable $PythonExe -Arguments @(
@@ -134,6 +156,10 @@ try {
 }
 finally {
   $env:PYTHONPATH = $OriginalPythonPath
+  $env:TEMP = $OriginalTemp
+  $env:TMP = $OriginalTmp
+  $env:TMPDIR = $OriginalTmpDir
+  $env:PYTHONDONTWRITEBYTECODE = $OriginalDontWriteBytecode
   Pop-Location
 }
 exit $ExitCode

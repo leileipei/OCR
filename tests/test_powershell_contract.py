@@ -283,7 +283,7 @@ def test_install_and_collect_use_distinct_monotonic_attempts_and_retry_states():
 def test_scheduler_acl_uses_atomic_mutation_rights_and_protects_attempt_parent():
     text = SCHEDULER.read_text(encoding="utf-8")
     verifier = text.split("function Assert-Phase0RestrictedSchedulePath", 1)[1].split(
-        "function New-Phase0RestrictedScheduleDirectory", 1
+        "function Assert-Phase0WritableScheduleDirectory", 1
     )[0]
     assert "FileSystemRights]::Modify" not in verifier
     for right in (
@@ -304,6 +304,29 @@ def test_scheduler_acl_uses_atomic_mutation_rights_and_protects_attempt_parent()
     )[0]
     assert "SetAccessControl($attemptPath" in directory_creator
     assert "Assert-Phase0RestrictedSchedulePath -Path $attemptPath" in directory_creator
+
+
+def test_scheduled_acl_domains_separate_secure_inputs_from_exact_writable_runtime():
+    scheduler = SCHEDULER.read_text(encoding="utf-8")
+    runner = WINDOWS_RUNNER.read_text(encoding="utf-8")
+    assert "New-Phase0ScheduleRuntimeDirectories" in scheduler
+    assert "Assert-Phase0WritableScheduleDirectory" in scheduler
+    for relative in (
+        "run/scheduled/logs",
+        "run/scheduled/output",
+        "run/scheduled/temp",
+    ):
+        assert relative in scheduler
+    assert '"run/scheduled/output/$validation"' in scheduler
+    assert '"run/scheduled/logs/stdout.log"' in scheduler
+    assert '"run/scheduled/logs/stderr.log"' in scheduler
+    assert '"run/scheduled/temp"' in scheduler
+    assert "Assert-Phase0ScheduleRuntimeDirectories" in scheduler
+    assert "[string]$Configuration.temp_dir" in scheduler
+    assert "$env:TEMP = $TempDir" in runner
+    assert "$env:TMP = $TempDir" in runner
+    assert "$env:TMPDIR = $TempDir" in runner
+    assert "$scheduled = $ExecutionMode -eq 'Scheduled'" in scheduler
 
 
 def test_scheduled_failures_and_cleanup_are_terminal_and_auditable():
@@ -417,48 +440,78 @@ def test_windows_runner_binds_campaign_mode_and_separate_output_directories():
     assert "return [int]$exitCode" in scheduler
 
 
-def test_restricted_schedule_acl_round_trip_on_windows(tmp_path):
+def test_restricted_schedule_acl_round_trip_with_non_admin_account_on_windows():
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if os.name != "nt" or not powershell:
         pytest.skip("Windows ACL round-trip requires a Windows host")
-    script = f"""
+    script = rf"""
+$userName = 'UmiAcl' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$root = Join-Path $env:ProgramData ('UmiOcrAclTest-' + [guid]::NewGuid().ToString('N'))
+$createdUser = $false
+if (-not (Get-Command New-LocalUser -ErrorAction SilentlyContinue)) {{ exit 77 }}
+try {{
+    $null = New-Item -ItemType Directory -Path $root
+    $password = ConvertTo-SecureString ('Umi!' + [guid]::NewGuid().ToString('N') + '9a') -AsPlainText -Force
+    $user = New-LocalUser -Name $userName -Password $password -PasswordNeverExpires -UserMayNotChangePassword
+    $createdUser = $true
+    $sid = $user.SID
+    $credential = New-Object System.Management.Automation.PSCredential(".\$userName", $password)
 $module = Import-Module '{SCHEDULER}' -Force -PassThru
-& $module {{
-    param([string]$Root)
-    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-    $attemptPath = Join-Path $Root 'attempt'
-    $null = New-Item -ItemType Directory -Path $attemptPath
-    $attempt = [pscustomobject]@{{ root = $attemptPath; number = 1 }}
-    $secure = New-Phase0RestrictedScheduleDirectory -PackageRoot $Root -Attempt $attempt `
-        -ValidationId 'acl-round-trip' -AccountSid $sid
-    $record = Write-Phase0RestrictedJsonAtomic -PackageRoot $Root -Directory $secure `
-        -Name 'arguments.json' -Value ([ordered]@{{ ok = $true }}) -AccountSid $sid
-    $null = Assert-Phase0RestrictedSchedulePath -Path $attemptPath -AccountSid $sid.Value -Kind Directory
-    $null = Assert-Phase0RestrictedSchedulePath -Path $secure -AccountSid $sid.Value -Kind Directory
-    $null = Assert-Phase0RestrictedSchedulePath -Path $record.path -AccountSid $sid.Value -Kind File
-    $original = Get-Acl -LiteralPath $record.path
-    foreach ($right in @(
-        [System.Security.AccessControl.FileSystemRights]::WriteData,
-        [System.Security.AccessControl.FileSystemRights]::Delete,
-        [System.Security.AccessControl.FileSystemRights]::ChangePermissions
-    )) {{
-        $mutated = New-Phase0ScheduleSecurity -AccountSid $sid
-        $bad = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $sid, ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor $right),
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $null = $mutated.SetAccessRule($bad)
-        Set-Acl -LiteralPath $record.path -AclObject $mutated
-        try {{
-            $null = Assert-Phase0RestrictedSchedulePath -Path $record.path -AccountSid $sid.Value -Kind File
-            throw "mutation right was accepted: $right"
-        }} catch {{
-            if ($_.Exception.Message -like 'mutation right was accepted:*') {{ throw }}
-        }} finally {{
-            Set-Acl -LiteralPath $record.path -AclObject $original
+    $paths = & $module {{
+        param([string]$Root, $Sid)
+        $attemptPath = Join-Path $Root 'attempt'
+        $null = New-Item -ItemType Directory -Path $attemptPath
+        $attempt = [pscustomobject]@{{ root = $attemptPath; number = 1 }}
+        $secure = New-Phase0RestrictedScheduleDirectory -PackageRoot $Root -Attempt $attempt `
+            -ValidationId 'acl-round-trip' -AccountSid $Sid
+        $runtime = New-Phase0ScheduleRuntimeDirectories -PackageRoot $Root -Attempt $attempt -AccountSid $Sid
+        $arguments = Write-Phase0RestrictedJsonAtomic -PackageRoot $Root -Directory $secure `
+            -Name 'arguments.json' -Value ([ordered]@{{ ok = $true }}) -AccountSid $Sid
+        $metadata = Write-Phase0RestrictedJsonAtomic -PackageRoot $Root -Directory $secure `
+            -Name 'install-metadata.json' -Value ([ordered]@{{ ok = $true }}) -AccountSid $Sid
+        [pscustomobject]@{{
+            arguments = $arguments.path; metadata = $metadata.path; secure = $secure
+            logs = $runtime.logs; output = $runtime.output; temp = $runtime.temp
         }}
+    }} $root $sid
+    $argumentsHash = (Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash
+    $metadataHash = (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash
+    $child = @"
+`$ErrorActionPreference = 'Stop'
+`$log = New-Object System.IO.FileStream('$($paths.logs)\probe.log', [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+`$log.WriteByte(1); `$log.Dispose()
+`$null = [System.IO.Directory]::CreateDirectory('$($paths.output)\probe-output')
+[System.IO.File]::WriteAllText('$($paths.temp)\probe.tmp', 'ok')
+foreach (`$target in @('$($paths.arguments)', '$($paths.metadata)')) {{
+    foreach (`$operation in @('write', 'delete', 'move')) {{
+        try {{
+            if (`$operation -eq 'write') {{ [System.IO.File]::WriteAllText(`$target, 'tampered') }}
+            elseif (`$operation -eq 'delete') {{ [System.IO.File]::Delete(`$target) }}
+            else {{ [System.IO.File]::Move(`$target, (`$target + '.moved')) }}
+            exit 12
+        }} catch [System.UnauthorizedAccessException] {{ }}
     }}
-}} '{tmp_path}'
+}}
+try {{ [System.IO.Directory]::Delete('$($paths.secure)', `$true); exit 13 }} catch [System.UnauthorizedAccessException] {{ }}
+exit 0
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+    $process = Start-Process -FilePath $PSHOME\powershell.exe -Credential $credential `
+        -ArgumentList "-NoProfile -NonInteractive -EncodedCommand $encoded" -Wait -PassThru
+    if ($process.ExitCode -ne 0) {{ throw "non-admin ACL probe failed: $($process.ExitCode)" }}
+    if ((Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash -ne $argumentsHash -or
+        (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash -ne $metadataHash) {{
+        throw 'secure schedule evidence changed during low-privilege probe'
+    }}
+}}
+catch {{
+    if (-not $createdUser) {{ exit 77 }}
+    throw
+}}
+finally {{
+    if ($createdUser) {{ Remove-LocalUser -Name $userName -ErrorAction SilentlyContinue }}
+    if (Test-Path -LiteralPath $root) {{ Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }}
+}}
 """
     result = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
@@ -466,6 +519,8 @@ $module = Import-Module '{SCHEDULER}' -Force -PassThru
         check=False,
         text=True,
     )
+    if result.returncode == 77:
+        pytest.skip("Windows host cannot provision a temporary non-admin local account")
     assert result.returncode == 0, result.stderr
 
 
@@ -565,15 +620,16 @@ def test_runner_relationship_guard_rejects_arbitrary_python_on_windows(tmp_path)
         "global_options": str(tmp_path / "templates" / "global-options.json"),
         "local_options": str(tmp_path / "templates" / "local-options.json"),
         "min_pages": 100,
-        "output_dir": str(attempt / "ocr" / "scheduled" / validation_id),
+        "output_dir": str(attempt / "run" / "scheduled" / "output" / validation_id),
         "package_root": str(tmp_path),
         "plugin_name": "win7_x64_RapidOCR-json",
         "plugin_root": str(umi / "plugins"),
         "project_root": str(tmp_path),
         "python_exe": str(evil),
         "samples_manifest": str(tmp_path / "templates" / "samples.json"),
-        "stderr_log": "",
-        "stdout_log": "",
+        "stderr_log": str(attempt / "run" / "scheduled" / "logs" / "stderr.log"),
+        "stdout_log": str(attempt / "run" / "scheduled" / "logs" / "stdout.log"),
+        "temp_dir": str(attempt / "run" / "scheduled" / "temp"),
         "test_python_exe": str(tmp_path / "runtime" / "python" / "python.exe"),
         "umi_data_root": str(umi),
         "validation_id": validation_id,

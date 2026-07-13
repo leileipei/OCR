@@ -150,6 +150,40 @@ function New-Phase0ScheduleSecurity {
     return $security
 }
 
+function New-Phase0ScheduleRuntimeSecurity {
+    param([System.Security.Principal.SecurityIdentifier]$AccountSid)
+    $sids = Get-Phase0WellKnownSids
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $security.SetOwner($sids.administrators)
+    $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    foreach ($sid in @($sids.system, $sids.administrators)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, [System.Security.AccessControl.FileSystemRights]::FullControl, $inherit,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $null = $security.AddAccessRule($rule)
+    }
+    $rootRights = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+        [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+        [System.Security.AccessControl.FileSystemRights]::AppendData
+    $rootRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $AccountSid, $rootRights, [System.Security.AccessControl.InheritanceFlags]::None,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $childRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $AccountSid, [System.Security.AccessControl.FileSystemRights]::Modify, $inherit,
+        [System.Security.AccessControl.PropagationFlags]::InheritOnly,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $null = $security.AddAccessRule($rootRule)
+    $null = $security.AddAccessRule($childRule)
+    return $security
+}
+
 function ConvertTo-Phase0Sid {
     param($IdentityReference)
     return $IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
@@ -214,6 +248,67 @@ function Assert-Phase0RestrictedSchedulePath {
     return $observedAccount
 }
 
+function Assert-Phase0WritableScheduleDirectory {
+    param([string]$Path, [string]$AccountSid)
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'Writable schedule path is not a normal directory'
+    }
+    $acl = Get-Acl -LiteralPath $Path
+    if (-not $acl.AreAccessRulesProtected) { throw 'Writable schedule ACL inheritance must be disabled' }
+    $sids = Get-Phase0WellKnownSids
+    try { $owner = (New-Object System.Security.Principal.NTAccount($acl.Owner)).Translate([System.Security.Principal.SecurityIdentifier]) }
+    catch { $owner = New-Object System.Security.Principal.SecurityIdentifier($acl.Owner) }
+    if ($owner.Value -notin @($sids.administrators.Value, $sids.system.Value)) {
+        throw 'Writable schedule owner is not trusted'
+    }
+    $seenAdministrators = $false; $seenSystem = $false
+    $seenAccountRoot = $false; $seenAccountChildren = $false
+    foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.IsInherited -or $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+            throw 'Writable schedule ACL contains inherited or deny rules'
+        }
+        $sid = [string]$rule.IdentityReference.Value
+        if ($sid -eq $sids.administrators.Value -or $sid -eq $sids.system.Value) {
+            if (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne
+                [System.Security.AccessControl.FileSystemRights]::FullControl) { throw 'Writable schedule trusted principals require full control' }
+            if ($sid -eq $sids.administrators.Value) { $seenAdministrators = $true } else { $seenSystem = $true }
+            continue
+        }
+        if ($sid -ne $AccountSid) { throw 'Writable schedule ACL has extra identities' }
+        $inherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        if ($rule.InheritanceFlags -eq [System.Security.AccessControl.InheritanceFlags]::None -and
+            $rule.PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::None) {
+            $required = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
+                [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+                [System.Security.AccessControl.FileSystemRights]::AppendData
+            $forbidden = [System.Security.AccessControl.FileSystemRights]::Delete -bor
+                [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+                [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+            if (($rule.FileSystemRights -band $required) -ne $required -or
+                ($rule.FileSystemRights -band $forbidden) -ne 0) { throw 'Writable schedule root rights are not minimal' }
+            $seenAccountRoot = $true
+        }
+        elseif ($rule.InheritanceFlags -eq $inherit -and
+            $rule.PropagationFlags -eq [System.Security.AccessControl.PropagationFlags]::InheritOnly) {
+            $administrative = [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+                [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+            if (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -ne
+                [System.Security.AccessControl.FileSystemRights]::Modify -or
+                ($rule.FileSystemRights -band $administrative) -ne 0) { throw 'Writable schedule child rights are not minimal' }
+            $seenAccountChildren = $true
+        }
+        else { throw 'Writable schedule account ACE scope is invalid' }
+    }
+    if (-not $seenAdministrators -or -not $seenSystem -or -not $seenAccountRoot -or -not $seenAccountChildren) {
+        throw 'Writable schedule ACL is incomplete'
+    }
+    return $AccountSid
+}
+
 function New-Phase0RestrictedScheduleDirectory {
     param([string]$PackageRoot, $Attempt, [string]$ValidationId, [System.Security.Principal.SecurityIdentifier]$AccountSid)
     $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
@@ -238,6 +333,49 @@ function New-Phase0RestrictedScheduleDirectory {
     }
     $result = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $scheduleRelative
     return $result
+}
+
+function New-Phase0ScheduleRuntimeDirectories {
+    param([string]$PackageRoot, $Attempt, [System.Security.Principal.SecurityIdentifier]$AccountSid)
+    $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
+    $attemptRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $Attempt.root
+    $attemptPath = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $attemptRelative
+    $null = Assert-Phase0RestrictedSchedulePath -Path $attemptPath -AccountSid $AccountSid.Value -Kind Directory
+    foreach ($relative in @("$attemptRelative/run", "$attemptRelative/run/scheduled")) {
+        $path = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative -AllowMissing
+        if (Test-Path -LiteralPath $path) { throw 'Scheduled runtime parent already exists' }
+        $security = New-Phase0ScheduleSecurity -AccountSid $AccountSid -Directory
+        $null = [System.IO.Directory]::CreateDirectory($path, $security)
+        $null = Assert-Phase0RestrictedSchedulePath -Path $path -AccountSid $AccountSid.Value -Kind Directory
+    }
+    $result = [ordered]@{}
+    foreach ($name in @('logs', 'output', 'temp')) {
+        $relative = "$attemptRelative/run/scheduled/$name"
+        $path = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative -AllowMissing
+        $security = New-Phase0ScheduleRuntimeSecurity -AccountSid $AccountSid
+        $null = [System.IO.Directory]::CreateDirectory($path, $security)
+        $null = Assert-Phase0WritableScheduleDirectory -Path $path -AccountSid $AccountSid.Value
+        $result[$name] = $path
+    }
+    return [pscustomobject]$result
+}
+
+function Assert-Phase0ScheduleRuntimeDirectories {
+    param([string]$PackageRoot, [string]$AttemptRoot, [string]$AccountSid)
+    $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
+    $attemptRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $AttemptRoot
+    foreach ($relative in @($attemptRelative, "$attemptRelative/run", "$attemptRelative/run/scheduled")) {
+        $path = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative
+        $null = Assert-Phase0RestrictedSchedulePath -Path $path -AccountSid $AccountSid -Kind Directory
+    }
+    $result = [ordered]@{}
+    foreach ($name in @('logs', 'output', 'temp')) {
+        $relative = "$attemptRelative/run/scheduled/$name"
+        $path = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative
+        $null = Assert-Phase0WritableScheduleDirectory -Path $path -AccountSid $AccountSid
+        $result[$name] = $path
+    }
+    return [pscustomobject]$result
 }
 
 function Write-Phase0RestrictedJsonAtomic {
@@ -315,6 +453,7 @@ function Get-Phase0RunnerConfiguration {
     $plugin = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath ([string]$context.umi_plugin_relative)
     $projectRoot = if (Test-Path -LiteralPath (Join-Path $root 'toolkit/src') -PathType Container) { Join-Path $root 'toolkit' } else { $root }
     $mode = $ExecutionMode.ToLowerInvariant()
+    $scheduled = $ExecutionMode -eq 'Scheduled'
     return [pscustomobject][ordered]@{
         package_root = $root; project_root = $projectRoot
         umi_data_root = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetDirectoryName($runtimePython))
@@ -322,9 +461,12 @@ function Get-Phase0RunnerConfiguration {
         plugin_root = [System.IO.Path]::GetDirectoryName($plugin); plugin_name = [System.IO.Path]::GetFileName($plugin)
         global_options = Join-Path $root 'templates/global-options.json'; local_options = Join-Path $root 'templates/local-options.json'
         samples_manifest = Join-Path $root 'templates/samples.json'; validation_id = $ValidationId; campaign_id = $CampaignId
-        execution_mode = $ExecutionMode; output_dir = Join-Path $Attempt.root "ocr/$mode/$ValidationId"
+        execution_mode = $ExecutionMode
+        output_dir = if ($scheduled) { Join-Path $Attempt.root "run/scheduled/output/$ValidationId" } else { Join-Path $Attempt.root "ocr/$mode/$ValidationId" }
+        temp_dir = if ($scheduled) { Join-Path $Attempt.root "run/scheduled/temp" } else { '' }
         min_pages = 100; business_concurrency_limit = 5
-        stdout_log = Join-Path $Attempt.root "$mode-stdout.log"; stderr_log = Join-Path $Attempt.root "$mode-stderr.log"
+        stdout_log = if ($scheduled) { Join-Path $Attempt.root "run/scheduled/logs/stdout.log" } else { Join-Path $Attempt.root "$mode-stdout.log" }
+        stderr_log = if ($scheduled) { Join-Path $Attempt.root "run/scheduled/logs/stderr.log" } else { Join-Path $Attempt.root "$mode-stderr.log" }
         attempt = [int]$Attempt.number
     }
 }
@@ -335,7 +477,7 @@ function Assert-Phase0RunnerConfiguration {
     $expectedProperties = @(
         'attempt', 'business_concurrency_limit', 'campaign_id', 'execution_mode', 'global_options', 'local_options',
         'min_pages', 'output_dir', 'package_root', 'plugin_name', 'plugin_root', 'project_root', 'python_exe',
-        'samples_manifest', 'stderr_log', 'stdout_log', 'test_python_exe', 'umi_data_root', 'validation_id'
+        'samples_manifest', 'stderr_log', 'stdout_log', 'temp_dir', 'test_python_exe', 'umi_data_root', 'validation_id'
     ) | Sort-Object
     if (@(Compare-Object $expectedProperties @($Configuration.PSObject.Properties.Name | Sort-Object)).Count -ne 0) {
         throw 'Runner configuration contains unexpected or missing fields'
@@ -358,14 +500,27 @@ function Assert-Phase0RunnerConfiguration {
         test_python_exe = Join-Path $root 'runtime/python/python.exe'; python_exe = Join-Path $umiData 'runtime/python.exe'
         plugin_root = Join-Path $umiData 'plugins'; global_options = Join-Path $root 'templates/global-options.json'
         local_options = Join-Path $root 'templates/local-options.json'; samples_manifest = Join-Path $root 'templates/samples.json'
-        output_dir = Join-Path $attemptRoot ("ocr/" + ([string]$Configuration.execution_mode).ToLowerInvariant() + "/$validation")
+    }
+    $mode = ([string]$Configuration.execution_mode).ToLowerInvariant()
+    if ($Configuration.execution_mode -eq 'Scheduled') {
+        $expected.output_dir = Join-Path $attemptRoot "run/scheduled/output/$validation"
+        $expected.temp_dir = Join-Path $attemptRoot "run/scheduled/temp"
+        $expected.stdout_log = Join-Path $attemptRoot "run/scheduled/logs/stdout.log"
+        $expected.stderr_log = Join-Path $attemptRoot "run/scheduled/logs/stderr.log"
+    }
+    else {
+        $expected.output_dir = Join-Path $attemptRoot "ocr/$mode/$validation"
     }
     foreach ($name in $expected.Keys) { Assert-Phase0ExactPath -Actual ([string]$Configuration.$name) -Expected $expected[$name] -Name $name }
-    $mode = ([string]$Configuration.execution_mode).ToLowerInvariant()
+    if ($Configuration.execution_mode -ne 'Scheduled' -and
+        -not [string]::IsNullOrWhiteSpace([string]$Configuration.temp_dir)) { throw 'Interactive runner temporary path must be empty' }
     $hasStdout = -not [string]::IsNullOrWhiteSpace([string]$Configuration.stdout_log)
     $hasStderr = -not [string]::IsNullOrWhiteSpace([string]$Configuration.stderr_log)
     if ($hasStdout -ne $hasStderr) { throw 'Runner logs must be configured together' }
-    if ($hasStdout) {
+    if ($Configuration.execution_mode -eq 'Scheduled' -and -not $hasStdout) {
+        throw 'Scheduled runner logs are required'
+    }
+    if ($hasStdout -and $Configuration.execution_mode -ne 'Scheduled') {
         Assert-Phase0ExactPath -Actual ([string]$Configuration.stdout_log) -Expected (Join-Path $attemptRoot "$mode-stdout.log") -Name stdout_log
         Assert-Phase0ExactPath -Actual ([string]$Configuration.stderr_log) -Expected (Join-Path $attemptRoot "$mode-stderr.log") -Name stderr_log
     }
@@ -375,7 +530,7 @@ function Assert-Phase0RunnerConfiguration {
         $relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $path
         $null = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative
     }
-    foreach ($path in @([string]$Configuration.output_dir, [string]$Configuration.stdout_log, [string]$Configuration.stderr_log)) {
+    foreach ($path in @([string]$Configuration.output_dir, [string]$Configuration.stdout_log, [string]$Configuration.stderr_log, [string]$Configuration.temp_dir)) {
         if ([string]::IsNullOrWhiteSpace($path)) { continue }
         $relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $path
         $null = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $relative -AllowMissing
@@ -434,6 +589,11 @@ function Read-Phase0TrustedRunnerArguments {
         $null = Assert-Phase0RestrictedSchedulePath -Path $attemptParent -AccountSid $metadata.account_sid -Kind Directory
         $null = Assert-Phase0RestrictedSchedulePath -Path $secureParent -AccountSid $metadata.account_sid -Kind Directory
         $null = Assert-Phase0RestrictedSchedulePath -Path $trustedArgument -AccountSid $metadata.account_sid -Kind File
+        $runtime = Assert-Phase0ScheduleRuntimeDirectories -PackageRoot $root -AttemptRoot $validated.attempt_root -AccountSid $metadata.account_sid
+        Assert-Phase0ExactPath -Actual ([string]$configuration.stdout_log) -Expected (Join-Path $runtime.logs 'stdout.log') -Name stdout_log
+        Assert-Phase0ExactPath -Actual ([string]$configuration.stderr_log) -Expected (Join-Path $runtime.logs 'stderr.log') -Name stderr_log
+        Assert-Phase0ExactPath -Actual ([string]$configuration.output_dir) -Expected (Join-Path $runtime.output $validation) -Name output_dir
+        Assert-Phase0ExactPath -Actual ([string]$configuration.temp_dir) -Expected $runtime.temp -Name temp_dir
         if ((Get-Phase0Sha256 -Path $trustedArgument) -ne $metadata.argument_sha256 -or
             $metadata.argument_file_relative -ne $relative -or $metadata.campaign_id -ne $campaign -or
             $metadata.validation_id -ne $validation -or [int]$metadata.install_attempt -ne [int]$configuration.attempt) {
@@ -611,6 +771,7 @@ function Get-Phase0ScheduleRecords {
             if ($metadata.account_sid -ne $secureAccount) { throw 'Secure directory execution SID mismatch' }
             if ($metadata.campaign_id -ne $CampaignId) { throw 'Schedule campaign binding mismatch' }
             $attemptNumber = [int]($directory.Name.Substring('attempt-'.Length))
+            $null = Assert-Phase0ScheduleRuntimeDirectories -PackageRoot $PackageRoot -AttemptRoot $directory.FullName -AccountSid $metadata.account_sid
             $attemptRelative = "work/campaigns/$CampaignId/attempts/$($directory.Name)"
             $expectedSecure = "$attemptRelative/secure/schedule-$($metadata.validation_id)"
             $expectedArgument = "$expectedSecure/arguments.json"
@@ -685,6 +846,7 @@ function Install-Phase0ScheduledTask {
     $configuration = Get-Phase0RunnerConfiguration -PackageRoot $PackageRoot -CampaignId $CampaignId -ValidationId $ValidationId -ExecutionMode Scheduled -Attempt $attempt
     $null = Assert-Phase0RunnerConfiguration -PackageRoot $PackageRoot -Configuration $configuration
     $secureDirectory = New-Phase0RestrictedScheduleDirectory -PackageRoot $PackageRoot -Attempt $attempt -ValidationId $ValidationId -AccountSid $accountSid
+    $null = New-Phase0ScheduleRuntimeDirectories -PackageRoot $PackageRoot -Attempt $attempt -AccountSid $accountSid
     $argumentRecord = Write-Phase0RestrictedJsonAtomic -PackageRoot $PackageRoot -Directory $secureDirectory -Name 'arguments.json' -Value $configuration -AccountSid $accountSid
     $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
     $expectedPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
