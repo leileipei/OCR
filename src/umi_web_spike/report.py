@@ -6,7 +6,13 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from .e10_evidence import E10Evidence
-from .evidence import SCHEMA_VERSION, is_utc_timestamp, validate_validation_id
+from .evidence import (
+    SCHEMA_VERSION,
+    WORKER_CALCULATION_BASIS,
+    is_utc_timestamp,
+    sha256_file,
+    validate_validation_id,
+)
 
 
 EXPECTED_OUTCOMES = {
@@ -99,8 +105,15 @@ def _validate_sample(sample: Any, source: str, errors: Dict[str, List[str]]) -> 
     _require_bool(sample, "ok", source, errors, True)
     if not isinstance(sample.get("path"), str) or not sample["path"].strip():
         _error(errors, source, "{} 缺少样本路径".format(category))
-    if not isinstance(sample.get("input_sha256"), str) or not HASH_PATTERN.fullmatch(sample["input_sha256"]):
+    digest = sample.get("input_sha256")
+    if not isinstance(digest, str) or not HASH_PATTERN.fullmatch(digest):
         _error(errors, source, "{} 的输入 SHA-256 无效".format(category))
+    else:
+        sample_path = Path(sample.get("path", ""))
+        if not sample_path.is_absolute() or not sample_path.is_file():
+            _error(errors, source, "{} 的样本路径必须是存在的绝对文件路径".format(category))
+        elif sha256_file(sample_path) != digest:
+            _error(errors, source, "{} 的输入 SHA-256 与实际文件不一致".format(category))
     if category in ("simplified_chinese_image", "mixed_chinese_english_image"):
         if sample.get("input_nonblank") is not True:
             _error(errors, source, "{} 输入图片必须实际检测为非空白".format(category))
@@ -108,6 +121,16 @@ def _validate_sample(sample: Any, source: str, errors: Dict[str, List[str]]) -> 
             _error(errors, source, "{} OCR code 必须为 100".format(category))
         if not _positive_number(sample.get("non_empty_text_blocks"), integer=True):
             _error(errors, source, "{} 必须包含非空 OCR 文本块".format(category))
+        ocr_text = sample.get("ocr_text")
+        if not isinstance(ocr_text, str) or not ocr_text.strip():
+            _error(errors, source, "{} 必须记录非空 OCR 文本".format(category))
+        elif category == "simplified_chinese_image" and not re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", ocr_text):
+            _error(errors, source, "简体中文图片 OCR 文本必须实际包含 CJK 字符")
+        elif category == "mixed_chinese_english_image" and not (
+            re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", ocr_text)
+            and re.search(r"[A-Za-z]", ocr_text)
+        ):
+            _error(errors, source, "中英混排图片 OCR 文本必须同时包含 CJK 与拉丁字母")
     elif category == "scanned_pdf_rotated_blank":
         if sample.get("source_has_text") is not False:
             _error(errors, source, "扫描 PDF 源文件必须确认无文本层")
@@ -139,7 +162,9 @@ def _positive_number(value: Any, integer: bool = False, allow_zero: bool = False
     return value >= 0 if allow_zero else value > 0
 
 
-def _validate_resources(value: Dict[str, Any], errors: Dict[str, List[str]]) -> None:
+def _validate_resources(
+    value: Dict[str, Any], errors: Dict[str, List[str]], scanned_pdf_pages: Optional[int]
+) -> None:
     source = "resources"
     _require_bool(value, "ok", source, errors, True)
     details = value.get("details")
@@ -148,9 +173,15 @@ def _validate_resources(value: Dict[str, Any], errors: Dict[str, List[str]]) -> 
         return
     positive_fields = (
         "observed_peak_process_tree_rss_bytes", "duration_seconds", "processed_pages",
-        "pages_per_minute", "sample_count", "recommended_workers",
+        "pages_per_minute", "sample_count", "recommended_workers", "memory_budget_bytes",
+        "logical_cpu_count", "memory_worker_limit", "cpu_worker_limit",
+        "business_concurrency_limit",
     )
-    integer_fields = {"observed_peak_process_tree_rss_bytes", "processed_pages", "sample_count", "recommended_workers"}
+    integer_fields = {
+        "observed_peak_process_tree_rss_bytes", "processed_pages", "sample_count",
+        "recommended_workers", "memory_budget_bytes", "logical_cpu_count",
+        "memory_worker_limit", "cpu_worker_limit", "business_concurrency_limit",
+    }
     for field in positive_fields:
         if not _positive_number(details.get(field), integer=field in integer_fields):
             _error(errors, source, "{} 必须为正数".format(field))
@@ -162,8 +193,30 @@ def _validate_resources(value: Dict[str, Any], errors: Dict[str, List[str]]) -> 
     processed = details.get("processed_pages")
     if isinstance(processed, int) and not isinstance(processed, bool) and isinstance(minimum, int) and processed < minimum:
         _error(errors, source, "processed_pages 未达到页数门槛")
-    if not isinstance(details.get("worker_calculation_basis"), str) or not details["worker_calculation_basis"].strip():
-        _error(errors, source, "worker_calculation_basis 必须是非空字符串")
+    if scanned_pdf_pages is None or processed != scanned_pdf_pages:
+        _error(errors, source, "processed_pages 必须等于扫描 PDF 实际页数")
+    duration = details.get("duration_seconds")
+    pages_per_minute = details.get("pages_per_minute")
+    if _positive_number(duration) and _positive_number(processed, integer=True):
+        expected_rate = round(processed * 60.0 / duration, 6)
+        if pages_per_minute != expected_rate:
+            _error(errors, source, "pages_per_minute 与页数/耗时复算不一致")
+    peak = details.get("observed_peak_process_tree_rss_bytes")
+    memory_budget = details.get("memory_budget_bytes")
+    logical_cpu = details.get("logical_cpu_count")
+    business_limit = details.get("business_concurrency_limit")
+    if all(_positive_number(item, integer=True) for item in (peak, memory_budget, logical_cpu, business_limit)):
+        expected_memory_limit = max(1, memory_budget // peak)
+        expected_cpu_limit = max(1, logical_cpu // 2)
+        if details.get("memory_worker_limit") != expected_memory_limit:
+            _error(errors, source, "memory_worker_limit 复算不一致")
+        if details.get("cpu_worker_limit") != expected_cpu_limit:
+            _error(errors, source, "cpu_worker_limit 复算不一致")
+        expected_recommended = min(expected_memory_limit, expected_cpu_limit, business_limit)
+        if details.get("recommended_workers") != expected_recommended:
+            _error(errors, source, "recommended_workers 复算不一致")
+    if details.get("worker_calculation_basis") != WORKER_CALCULATION_BASIS:
+        _error(errors, source, "worker_calculation_basis 与固定计算口径不一致")
     _require_bool(details, "qt_loaded", source, errors, False)
     _require_bool(details, "interactive_session", source, errors, False)
     _require_bool(details, "headless", source, errors, True)
@@ -232,14 +285,30 @@ def build_report(results_dir: Path, e10_path: Path, report_path: Path) -> bool:
     if isinstance(pdf_details, dict):
         _require_bool(pdf_details, "searchable_text", "pdf", errors, True)
 
-    _validate_resources(values["resources"], errors)
+    scanned_pdf_pages = None
+    if isinstance(pdf_details, dict) and isinstance(pdf_details.get("samples"), list):
+        for sample in pdf_details["samples"]:
+            if isinstance(sample, dict) and sample.get("category") == "scanned_pdf_rotated_blank":
+                pages = sample.get("pages")
+                if isinstance(pages, int) and not isinstance(pages, bool):
+                    scanned_pdf_pages = pages
+                break
+    _validate_resources(values["resources"], errors, scanned_pdf_pages)
     manifest = values["manifest"]
     if manifest.get("status") != "completed":
         _error(errors, "manifest", "manifest.status 必须为 completed")
     _require_bool(manifest, "passed", "manifest", errors, True)
-    expected_evidence = ["ocr-image.json", "ocr-pdf.json", "resources.json"]
-    if manifest.get("evidence") != expected_evidence:
-        _error(errors, "manifest", "manifest.evidence 清单不完整或顺序错误")
+    expected_evidence = {"ocr-image.json", "ocr-pdf.json", "resources.json"}
+    manifest_evidence = manifest.get("evidence")
+    if not isinstance(manifest_evidence, dict) or set(manifest_evidence) != expected_evidence:
+        _error(errors, "manifest", "manifest.evidence 必须是三个证据文件的 SHA-256 映射")
+    else:
+        for name, digest in manifest_evidence.items():
+            evidence_path = Path(results_dir) / name
+            if not isinstance(digest, str) or not HASH_PATTERN.fullmatch(digest):
+                _error(errors, "manifest", "manifest.evidence.{} 摘要无效".format(name))
+            elif not evidence_path.is_file() or sha256_file(evidence_path) != digest:
+                _error(errors, "manifest", "manifest.evidence.{} 与实际文件不一致".format(name))
 
     passed = not any(errors.values())
     lines = ["# Umi-OCR Web 阶段 0 验证报告", "", "## 硬性门槛", ""]

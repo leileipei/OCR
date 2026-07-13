@@ -3,11 +3,14 @@ from __future__ import print_function
 import argparse
 import json
 import os
+import platform
+import re
 import shutil
 import sys
 import threading
 import time
 import uuid
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +25,7 @@ from .evidence import (
     utc_now,
     validate_validation_id,
     write_json,
+    WORKER_CALCULATION_BASIS,
 )
 from .pdf_probe import add_invisible_text_layer, render_pages
 from .plugin_runner import PluginRunner
@@ -38,6 +42,8 @@ EXPECTED_OUTCOMES = {
 }
 IMAGE_CATEGORIES = {"simplified_chinese_image", "mixed_chinese_english_image"}
 PDF_CATEGORIES = set(EXPECTED_OUTCOMES) - IMAGE_CATEGORIES
+CJK_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+LATIN_PATTERN = re.compile(r"[A-Za-z]")
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
@@ -154,10 +160,17 @@ def _run_image_sample(runner: PluginRunner, sample: Dict[str, str]) -> Dict[str,
         return result
     plugin_result = runner.run_path(Path(sample["path"]))
     non_empty = sum(1 for block in plugin_result.blocks if block.text.strip())
+    ocr_text = _result_text(plugin_result).strip()
     if plugin_result.code != 100:
         actual = "ocr_failed"
     elif non_empty == 0:
         actual = "empty_ocr_text"
+    elif sample["category"] == "simplified_chinese_image" and not CJK_PATTERN.search(ocr_text):
+        actual = "language_mismatch"
+    elif sample["category"] == "mixed_chinese_english_image" and not (
+        CJK_PATTERN.search(ocr_text) and LATIN_PATTERN.search(ocr_text)
+    ):
+        actual = "language_mismatch"
     else:
         actual = "ocr_success"
     result.update(
@@ -167,6 +180,7 @@ def _run_image_sample(runner: PluginRunner, sample: Dict[str, str]) -> Dict[str,
             "code": plugin_result.code,
             "blocks": len(plugin_result.blocks),
             "non_empty_text_blocks": non_empty,
+            "ocr_text": ocr_text,
         }
     )
     return result
@@ -250,31 +264,36 @@ def _run_classification_pdf(sample: Dict[str, str]) -> Dict[str, Any]:
 
 def _resource_result(
     common: Dict[str, Any], identity: Dict[str, Any], sampler: ProcessTreeSampler,
-    started: float, processed_pages: int, minimum_pages: int,
+    started: float, processed_pages: int, minimum_pages: int, business_concurrency_limit: int,
 ) -> Dict[str, Any]:
-    duration = max(time.perf_counter() - started, 0.000001)
+    duration = round(max(time.perf_counter() - started, 0.000001), 6)
     qt_loaded = bool(sampler.qt_processes) or any(name.startswith(("PySide", "PyQt")) for name in sys.modules)
     session_name = os.environ.get("SESSIONNAME", "")
     interactive = session_name.lower() != "services"
     peak = max(1, sampler.peak_rss)
     try:
         memory_budget = int(psutil.virtual_memory().available * 0.7)
-        basis = "floor(70% currently available memory / observed peak process-tree RSS), minimum 1"
     except (OSError, PermissionError):
         memory_budget = peak
-        basis = "system available memory unavailable; conservative one-worker fallback from observed peak process-tree RSS"
-    recommended = max(1, memory_budget // peak)
+    logical_cpu_count = psutil.cpu_count(logical=True) or 1
+    memory_worker_limit = max(1, memory_budget // peak)
+    cpu_worker_limit = max(1, logical_cpu_count // 2)
+    recommended = min(memory_worker_limit, cpu_worker_limit, business_concurrency_limit)
     details = {
         "observed_peak_process_tree_rss_bytes": sampler.peak_rss,
         "process_tree_cpu_seconds": round(sampler.cpu_seconds, 6),
-        "duration_seconds": round(duration, 6),
+        "duration_seconds": duration,
         "processed_pages": processed_pages,
         "minimum_required_pages": minimum_pages,
         "pages_per_minute": round(processed_pages * 60.0 / duration, 6),
         "sample_count": sampler.sample_count,
         "recommended_workers": recommended,
-        "worker_calculation_basis": basis,
+        "worker_calculation_basis": WORKER_CALCULATION_BASIS,
         "memory_budget_bytes": memory_budget,
+        "logical_cpu_count": logical_cpu_count,
+        "memory_worker_limit": memory_worker_limit,
+        "cpu_worker_limit": cpu_worker_limit,
+        "business_concurrency_limit": business_concurrency_limit,
         "qt_loaded": qt_loaded,
         "qt_processes": sorted(sampler.qt_processes),
         "session_name": session_name,
@@ -297,6 +316,8 @@ def _execute_validation(args: argparse.Namespace, working_dir: Path) -> bool:
     validation_id = validate_validation_id(args.validation_id)
     if args.min_pages < 1:
         raise ValueError("min_pages must be at least 1")
+    if args.business_concurrency_limit < 1:
+        raise ValueError("business_concurrency_limit must be at least 1")
     recorded = utc_now()
     common = envelope(validation_id, recorded)
     identity = execution_identity(Path(args.plugin_root), args.plugin_name)
@@ -329,14 +350,21 @@ def _execute_validation(args: argparse.Namespace, working_dir: Path) -> bool:
     pdf_ok = len(pdf_samples) == len(PDF_CATEGORIES) and all(item["ok"] is True for item in pdf_samples) and searchable_text
     image_evidence = {**common, **identity, "ok": image_ok, "name": "ocr-image", "details": {"samples": image_samples}}
     pdf_evidence = {**common, **identity, "ok": pdf_ok, "name": "ocr-pdf", "details": {"searchable_text": searchable_text, "samples": pdf_samples}}
-    resources = _resource_result(common, identity, sampler, started, processed_pages, args.min_pages)
+    resources = _resource_result(
+        common, identity, sampler, started, processed_pages, args.min_pages,
+        args.business_concurrency_limit,
+    )
     write_json(working_dir / "ocr-image.json", image_evidence)
     write_json(working_dir / "ocr-pdf.json", pdf_evidence)
     write_json(working_dir / "resources.json", resources)
     passed = image_ok and pdf_ok and resources["ok"] is True
+    evidence_digests = {
+        name: sha256_file(working_dir / name)
+        for name in ("ocr-image.json", "ocr-pdf.json", "resources.json")
+    }
     write_json(
         working_dir / "manifest.json",
-        {**common, "status": "completed", "evidence": ["ocr-image.json", "ocr-pdf.json", "resources.json"], "passed": passed},
+        {**common, "status": "completed", "evidence": evidence_digests, "passed": passed},
     )
     return passed
 
@@ -359,12 +387,20 @@ def _validate_ocr(args: argparse.Namespace) -> int:
         try:
             passed = _execute_validation(args, temporary)
         except Exception as error:
+            identity = execution_identity(Path(args.plugin_root), args.plugin_name)
             write_json(
                 temporary / "manifest.json",
                 {
                     **envelope(validation_id, utc_now()),
                     "status": "failed",
                     "diagnostic": "{}: {}".format(type(error).__name__, error),
+                    "traceback": traceback.format_exc(),
+                    **identity,
+                    "environment_summary": {
+                        "platform": platform.platform(),
+                        "session_name": os.environ.get("SESSIONNAME", ""),
+                        "process_id": os.getpid(),
+                    },
                 },
             )
         temporary.rename(output)
@@ -390,6 +426,7 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         validate.add_argument("--" + name, required=True)
     validate.add_argument("--min-pages", type=int, default=100)
+    validate.add_argument("--business-concurrency-limit", type=int, default=5)
     validate.set_defaults(handler=_validate_ocr)
     report = subparsers.add_parser("build-report")
     report.add_argument("--results-dir", required=True)

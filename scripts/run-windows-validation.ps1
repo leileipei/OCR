@@ -9,7 +9,8 @@ param(
   [Parameter(Mandatory=$true)][string]$LocalOptions,
   [Parameter(Mandatory=$true)][string]$SamplesManifest,
   [string]$ValidationId = ([guid]::NewGuid().ToString('N')),
-  [int]$MinPages = 100
+  [int]$MinPages = 100,
+  [int]$BusinessConcurrencyLimit = 5
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,7 +36,8 @@ try {
       --local-options-json $LocalOptions `
       --samples-manifest $SamplesManifest `
       --output-dir $OutputDir `
-      --min-pages $MinPages
+      --min-pages $MinPages `
+      --business-concurrency-limit $BusinessConcurrencyLimit
     $ExitCode = $LASTEXITCODE
   }
 } finally {

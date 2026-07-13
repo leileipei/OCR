@@ -54,6 +54,7 @@ def _validation_args(
     min_pages=1,
     scanned_pages=1,
     scanned_native_text=False,
+    business_concurrency_limit=5,
 ):
     samples = tmp_path / "samples"
     samples.mkdir()
@@ -109,6 +110,8 @@ def _validation_args(
         str(output),
         "--min-pages",
         str(min_pages),
+        "--business-concurrency-limit",
+        str(business_concurrency_limit),
     ]
 
 
@@ -125,6 +128,9 @@ def test_validate_ocr_publishes_complete_unique_atomic_evidence(tmp_path, monkey
     manifest = _read(output, "manifest.json")
     assert manifest["status"] == "completed"
     assert manifest["validation_id"] == "run-20260713-001"
+    assert set(manifest["evidence"]) == {"ocr-image.json", "ocr-pdf.json", "resources.json"}
+    for name, digest in manifest["evidence"].items():
+        assert digest == hashlib.sha256((output / name).read_bytes()).hexdigest()
     evidence = [_read(output, name) for name in ("ocr-image.json", "ocr-pdf.json", "resources.json")]
     assert all(item["schema_version"] == "1.0" for item in evidence)
     assert all(item["validation_id"] == manifest["validation_id"] for item in evidence)
@@ -144,6 +150,10 @@ def test_validate_ocr_publishes_complete_unique_atomic_evidence(tmp_path, monkey
     scanned = next(sample for sample in sample_results if sample["category"] == "scanned_pdf_rotated_blank")
     assert scanned["rotated_pages"] >= 1
     assert scanned["blank_pages"] >= 1
+    simplified = next(sample for sample in sample_results if sample["category"] == "simplified_chinese_image")
+    mixed = next(sample for sample in sample_results if sample["category"] == "mixed_chinese_english_image")
+    assert "中" in simplified["ocr_text"]
+    assert "中" in mixed["ocr_text"] and "English" in mixed["ocr_text"]
 
     resources = evidence[2]
     details = resources["details"]
@@ -155,7 +165,12 @@ def test_validate_ocr_publishes_complete_unique_atomic_evidence(tmp_path, monkey
     assert details["pages_per_minute"] > 0
     assert details["sample_count"] >= 1
     assert details["recommended_workers"] >= 1
-    assert details["worker_calculation_basis"]
+    assert details["logical_cpu_count"] >= 1
+    assert details["memory_worker_limit"] == max(1, details["memory_budget_bytes"] // details["observed_peak_process_tree_rss_bytes"])
+    assert details["cpu_worker_limit"] == max(1, details["logical_cpu_count"] // 2)
+    assert details["business_concurrency_limit"] == 5
+    assert details["recommended_workers"] == min(details["memory_worker_limit"], details["cpu_worker_limit"], 5)
+    assert details["worker_calculation_basis"] == "recommended_workers=min(memory_worker_limit,cpu_worker_limit,business_concurrency_limit); memory_worker_limit=max(1,floor(memory_budget_bytes/observed_peak_process_tree_rss_bytes)); cpu_worker_limit=max(1,floor(logical_cpu_count/2))"
     assert details["qt_loaded"] is False
     assert details["interactive_session"] is False
 
@@ -177,6 +192,7 @@ def test_validate_ocr_refuses_to_reuse_even_empty_target_directory(tmp_path, mon
 
 def test_validation_exception_atomically_publishes_failed_manifest(tmp_path, monkeypatch):
     monkeypatch.setenv("SESSIONNAME", "Services")
+    monkeypatch.setenv("SUPER_SECRET_TOKEN", "must-not-leak")
     output, args = _validation_args(tmp_path, global_values={"raise_names": ["mixed.png"]})
 
     assert main(args) == 1
@@ -184,6 +200,11 @@ def test_validation_exception_atomically_publishes_failed_manifest(tmp_path, mon
     assert manifest["status"] == "failed"
     assert manifest["validation_id"] == "run-20260713-001"
     assert isinstance(manifest["diagnostic"], str) and manifest["diagnostic"]
+    assert "Traceback (most recent call last)" in manifest["traceback"]
+    assert manifest["plugin"]["name"] == "fake_ocr_plugin"
+    assert manifest["interpreter"]["executable"] == sys.executable
+    assert set(manifest["environment_summary"]) == {"platform", "session_name", "process_id"}
+    assert "must-not-leak" not in json.dumps(manifest)
     assert not list(output.parent.glob(".*.tmp"))
 
 
@@ -197,6 +218,20 @@ def test_nonblank_image_requires_nonempty_ocr_text(tmp_path, monkeypatch):
     assert sample["actual"] == "empty_ocr_text"
     assert sample["ok"] is False
     assert image["ok"] is False
+
+
+@pytest.mark.parametrize(
+    ("name", "text"),
+    [("simplified.png", "English only"), ("mixed.png", "只有中文"), ("mixed.png", "   ")],
+)
+def test_image_language_coverage_uses_actual_ocr_text(tmp_path, monkeypatch, name, text):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path, global_values={"text_by_name": {name: text}})
+    assert main(args) == 1
+    image = _read(output, "ocr-image.json")
+    sample = next(item for item in image["details"]["samples"] if Path(item["path"]).name == name)
+    assert sample["ocr_text"] == text.strip()
+    assert sample["ok"] is False
 
 
 def test_blank_image_cannot_claim_positive_image_coverage(tmp_path, monkeypatch):
@@ -251,6 +286,13 @@ def test_min_pages_cannot_be_zero_to_bypass_resource_gate(tmp_path, monkeypatch)
     assert _read(output, "manifest.json")["status"] == "failed"
 
 
+def test_business_concurrency_limit_cannot_be_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path, business_concurrency_limit=0)
+    assert main(args) == 1
+    assert _read(output, "manifest.json")["status"] == "failed"
+
+
 def test_windows_script_uses_unique_run_and_manifest_contract():
     script = (PROJECT_ROOT / "scripts" / "run-windows-validation.ps1").read_text(encoding="utf-8")
     assert "[string]$ValidationId = ([guid]::NewGuid().ToString('N'))" in script
@@ -259,4 +301,6 @@ def test_windows_script_uses_unique_run_and_manifest_contract():
     assert "--validation-id $ValidationId" in script
     assert "--samples-manifest $SamplesManifest" in script
     assert "--min-pages $MinPages" in script
+    assert "--business-concurrency-limit $BusinessConcurrencyLimit" in script
+    assert "[int]$BusinessConcurrencyLimit = 5" in script
     assert "[int]$MinPages = 100" in script

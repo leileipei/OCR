@@ -1,5 +1,7 @@
 import json
+import hashlib
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -25,7 +27,7 @@ CATEGORIES = {
 }
 
 
-def _sample(category):
+def _sample(root, category):
     expected = {
         "simplified_chinese_image": "ocr_success",
         "mixed_chinese_english_image": "ocr_success",
@@ -34,16 +36,20 @@ def _sample(category):
         "corrupt_pdf": "open_failed",
         "encrypted_pdf": "encrypted_rejected",
     }[category]
+    input_path = root / "inputs" / "{}.dat".format(category)
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_bytes(("sample:" + category).encode("utf-8"))
     value = {
         "category": category,
-        "path": "C:\\samples\\{}.dat".format(category),
-        "input_sha256": "a" * 64,
+        "path": str(input_path.resolve()),
+        "input_sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
         "expected": expected,
         "actual": expected,
         "ok": True,
     }
     if category in ("simplified_chinese_image", "mixed_chinese_english_image"):
-        value.update({"input_nonblank": True, "code": 100, "non_empty_text_blocks": 1})
+        text = "简体中文识别" if category == "simplified_chinese_image" else "中文 OCR English"
+        value.update({"input_nonblank": True, "code": 100, "non_empty_text_blocks": 1, "ocr_text": text})
     elif category == "scanned_pdf_rotated_blank":
         value.update({"source_has_text": False, "pages": 100, "rotated_pages": 1, "blank_pages": 1, "ocr_text": "识别文本", "output_contains_ocr_text": True})
     elif category == "native_text_pdf":
@@ -55,12 +61,16 @@ def _sample(category):
     return value
 
 
-def _valid_evidence():
+def _valid_evidence(root):
+    official_document = root / "inputs" / "e10-official.pdf"
+    official_document.parent.mkdir(parents=True, exist_ok=True)
+    official_document.write_bytes(b"controlled official E10 document")
     e10 = {
         **COMMON,
         "protocol": "oidc",
         "official_document_reference": "E10 官方统一身份接口文档 v10",
-        "official_document_sha256": "b" * 64,
+        "official_document_path": str(official_document.resolve()),
+        "official_document_sha256": hashlib.sha256(official_document.read_bytes()).hexdigest(),
         "login_endpoint": "https://oa.example.internal/sso/authorize",
         "verification_endpoint": "https://oa.example.internal/sso/userinfo",
         "external_user_id_field": "user_id",
@@ -76,7 +86,7 @@ def _valid_evidence():
         "interpreter": INTERPRETER,
         "ok": True,
         "name": "ocr-image",
-        "details": {"samples": [_sample("simplified_chinese_image"), _sample("mixed_chinese_english_image")]},
+        "details": {"samples": [_sample(root, "simplified_chinese_image"), _sample(root, "mixed_chinese_english_image")]},
     }
     pdf = {
         **COMMON,
@@ -86,7 +96,7 @@ def _valid_evidence():
         "name": "ocr-pdf",
         "details": {
             "searchable_text": True,
-            "samples": [_sample(category) for category in CATEGORIES if category.endswith("pdf") or category.startswith(("scanned", "native", "corrupt", "encrypted"))],
+            "samples": [_sample(root, category) for category in CATEGORIES if category.endswith("pdf") or category.startswith(("scanned", "native", "corrupt", "encrypted"))],
         },
     }
     resources = {
@@ -104,22 +114,34 @@ def _valid_evidence():
             "pages_per_minute": 100.0,
             "sample_count": 2,
             "recommended_workers": 2,
-            "worker_calculation_basis": "memory_budget_bytes // observed_peak_process_tree_rss_bytes",
+            "worker_calculation_basis": "recommended_workers=min(memory_worker_limit,cpu_worker_limit,business_concurrency_limit); memory_worker_limit=max(1,floor(memory_budget_bytes/observed_peak_process_tree_rss_bytes)); cpu_worker_limit=max(1,floor(logical_cpu_count/2))",
+            "memory_budget_bytes": 4096,
+            "logical_cpu_count": 8,
+            "memory_worker_limit": 4,
+            "cpu_worker_limit": 4,
+            "business_concurrency_limit": 2,
             "qt_loaded": False,
             "interactive_session": False,
             "headless": True,
         },
     }
-    manifest = {**COMMON, "status": "completed", "passed": True, "evidence": ["ocr-image.json", "ocr-pdf.json", "resources.json"]}
+    manifest = {**COMMON, "status": "completed", "passed": True, "evidence": None}
     return {"e10.json": e10, "ocr-image.json": image, "ocr-pdf.json": pdf, "resources.json": resources, "manifest.json": manifest}
 
 
 def _write_evidence(tmp_path, mutate=None):
-    evidence = deepcopy(_valid_evidence())
+    evidence = deepcopy(_valid_evidence(tmp_path))
     if mutate:
         mutate(evidence)
-    for name, value in evidence.items():
+    for name in ("e10.json", "ocr-image.json", "ocr-pdf.json", "resources.json"):
+        value = evidence[name]
         (tmp_path / name).write_text(json.dumps(value), encoding="utf-8")
+    if evidence["manifest.json"].get("evidence") is None:
+        evidence["manifest.json"]["evidence"] = {
+            name: hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+            for name in ("ocr-image.json", "ocr-pdf.json", "resources.json")
+        }
+    (tmp_path / "manifest.json").write_text(json.dumps(evidence["manifest.json"]), encoding="utf-8")
     return evidence
 
 
@@ -239,6 +261,79 @@ def test_report_rejects_samples_stored_under_wrong_evidence_type(tmp_path):
 def test_report_rejects_blank_positive_image_even_with_ocr_text(tmp_path):
     def mutate(evidence):
         evidence["ocr-image.json"]["details"]["samples"][0]["input_nonblank"] = False
+
+    _write_evidence(tmp_path, mutate)
+    assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False
+
+
+@pytest.mark.parametrize(
+    ("category", "text"),
+    [("simplified_chinese_image", "English only"), ("mixed_chinese_english_image", "只有中文"), ("mixed_chinese_english_image", "")],
+)
+def test_report_recomputes_language_coverage_from_ocr_text(tmp_path, category, text):
+    def mutate(evidence):
+        sample = next(item for item in evidence["ocr-image.json"]["details"]["samples"] if item["category"] == category)
+        sample["ocr_text"] = text
+
+    _write_evidence(tmp_path, mutate)
+    assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False
+
+
+def test_report_rehashes_existing_sample_file(tmp_path):
+    evidence = _write_evidence(tmp_path)
+    sample_path = Path(evidence["ocr-image.json"]["details"]["samples"][0]["path"])
+    sample_path.write_bytes(b"changed after validation")
+    assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False
+
+
+def test_report_rejects_missing_sample_file_even_with_well_formed_digest(tmp_path):
+    def mutate(evidence):
+        sample = evidence["ocr-image.json"]["details"]["samples"][0]
+        sample["path"] = str((tmp_path / "missing.png").resolve())
+
+    _write_evidence(tmp_path, mutate)
+    assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False
+
+
+def test_report_rehashes_controlled_e10_document(tmp_path):
+    evidence = _write_evidence(tmp_path)
+    Path(evidence["e10.json"]["official_document_path"]).write_bytes(b"replaced document")
+    assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False
+
+
+def test_report_rehashes_manifest_evidence_files(tmp_path):
+    _write_evidence(tmp_path)
+    manifest_path = tmp_path / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["evidence"]["ocr-image.json"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("memory_budget_bytes", 3071),
+        ("logical_cpu_count", 7),
+        ("memory_worker_limit", 3),
+        ("cpu_worker_limit", 3),
+        ("business_concurrency_limit", 3),
+        ("recommended_workers", 3),
+        ("pages_per_minute", 99.9),
+    ],
+)
+def test_report_cross_checks_derived_resource_values(tmp_path, field, bad_value):
+    def mutate(evidence):
+        evidence["resources.json"]["details"][field] = bad_value
+
+    _write_evidence(tmp_path, mutate)
+    assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False
+
+
+def test_report_matches_processed_pages_to_scanned_pdf_evidence(tmp_path):
+    def mutate(evidence):
+        scanned = next(item for item in evidence["ocr-pdf.json"]["details"]["samples"] if item["category"] == "scanned_pdf_rotated_blank")
+        scanned["pages"] = 101
 
     _write_evidence(tmp_path, mutate)
     assert build_report(tmp_path, tmp_path / "e10.json", tmp_path / "report.md") is False

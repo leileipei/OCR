@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import urlparse
 
-from .evidence import SCHEMA_VERSION, is_utc_timestamp, validate_validation_id
+from .evidence import SCHEMA_VERSION, is_utc_timestamp, sha256_file, validate_validation_id
 
 
 ALLOWED_PROTOCOLS = {"oidc", "oauth2", "cas", "saml2", "official_ticket"}
@@ -20,6 +20,7 @@ class E10Evidence:
     recorded_at_utc: str
     protocol: str
     official_document_reference: str
+    official_document_path: str
     official_document_sha256: str
     login_endpoint: str
     verification_endpoint: str
@@ -63,6 +64,14 @@ class E10Evidence:
         digest = value.get("official_document_sha256")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("official_document_sha256 must be a lowercase SHA-256 digest")
+        raw_document_path = value.get("official_document_path")
+        if not isinstance(raw_document_path, str) or not raw_document_path.strip():
+            raise ValueError("official_document_path is required")
+        document_path = Path(raw_document_path)
+        if not document_path.is_absolute() or not document_path.is_file():
+            raise ValueError("official_document_path must be an absolute existing file")
+        if sha256_file(document_path) != digest:
+            raise ValueError("official_document_sha256 does not match official_document_path")
         for key in (
             "test_login_succeeded",
             "disabled_account_rejected",

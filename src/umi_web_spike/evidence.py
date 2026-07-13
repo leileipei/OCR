@@ -10,6 +10,11 @@ from typing import Any, Dict
 
 
 SCHEMA_VERSION = "1.0"
+WORKER_CALCULATION_BASIS = (
+    "recommended_workers=min(memory_worker_limit,cpu_worker_limit,business_concurrency_limit); "
+    "memory_worker_limit=max(1,floor(memory_budget_bytes/observed_peak_process_tree_rss_bytes)); "
+    "cpu_worker_limit=max(1,floor(logical_cpu_count/2))"
+)
 VALIDATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{5,127}$")
 
 
