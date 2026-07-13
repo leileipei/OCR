@@ -1,3 +1,6 @@
+from pathlib import Path
+
+
 class FakeApi:
     def __init__(self, global_options):
         self.global_options = global_options
@@ -11,6 +14,8 @@ class FakeApi:
     def runPath(self, path):
         if not self.started:
             return {"code": 900, "data": "not started"}
+        if Path(path).name in self.global_options.get("fail_names", []):
+            return {"code": 500, "data": "configured failure"}
         return {
             "code": 100,
             "data": [{"text": path, "score": 1.0, "box": [[0, 0], [1, 0], [1, 1], [0, 1]]}],

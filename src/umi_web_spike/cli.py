@@ -32,7 +32,7 @@ def _validate_ocr(args: argparse.Namespace) -> int:
     output.mkdir(parents=True, exist_ok=True)
     process = psutil.Process()
     started = time.perf_counter()
-    peak_rss = process.memory_info().rss
+    sampled_max_rss = process.memory_info().rss
     image_result = None
     page_results = []
 
@@ -43,11 +43,11 @@ def _validate_ocr(args: argparse.Namespace) -> int:
     ) as runner:
         runner.start(_load_json(Path(args.local_options_json)))
         image_result = runner.run_path(Path(args.image))
-        peak_rss = max(peak_rss, process.memory_info().rss)
+        sampled_max_rss = max(sampled_max_rss, process.memory_info().rss)
         rendered = render_pages(Path(args.pdf), output / "pages")
         for page_path in rendered:
             page_results.append(runner.run_path(page_path))
-            peak_rss = max(peak_rss, process.memory_info().rss)
+            sampled_max_rss = max(sampled_max_rss, process.memory_info().rss)
 
     image_ok = image_result.code == 100
     ProbeResult(
@@ -83,7 +83,7 @@ def _validate_ocr(args: argparse.Namespace) -> int:
         name="resources",
         details={
             "duration_seconds": round(time.perf_counter() - started, 3),
-            "peak_rss_bytes": peak_rss,
+            "sampled_max_rss_bytes": sampled_max_rss,
             "qt_loaded": qt_loaded,
             "session_name": session_name,
             "headless": not qt_loaded and session_name.lower() == "services",

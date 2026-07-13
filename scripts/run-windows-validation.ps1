@@ -11,16 +11,28 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-python -m pytest -q
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$ProjectRoot = (Resolve-Path $ProjectRoot).Path
+$OutputDir = Join-Path $ProjectRoot 'validation\results\live'
+$ExitCode = 0
 
 $env:PYTHONPATH = "$ProjectRoot\src;$UmiDataRoot\py_src\imports;$UmiDataRoot\site-packages"
-& $PythonExe -m umi_web_spike.cli validate-ocr `
-  --plugin-root $PluginRoot `
-  --plugin-name $PluginName `
-  --global-options-json $GlobalOptions `
-  --local-options-json $LocalOptions `
-  --image $Image `
-  --pdf $Pdf `
-  --output-dir validation/results/live
-exit $LASTEXITCODE
+Push-Location $ProjectRoot
+try {
+  & $PythonExe -m pytest -q
+  if ($LASTEXITCODE -ne 0) {
+    $ExitCode = $LASTEXITCODE
+  } else {
+    & $PythonExe -m umi_web_spike.cli validate-ocr `
+      --plugin-root $PluginRoot `
+      --plugin-name $PluginName `
+      --global-options-json $GlobalOptions `
+      --local-options-json $LocalOptions `
+      --image $Image `
+      --pdf $Pdf `
+      --output-dir $OutputDir
+    $ExitCode = $LASTEXITCODE
+  }
+} finally {
+  Pop-Location
+}
+exit $ExitCode
