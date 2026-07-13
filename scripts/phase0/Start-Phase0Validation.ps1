@@ -94,6 +94,7 @@ function Get-Phase0EntryResultsDirectory {
     Assert-Phase0EntryIdentifier -Value $ValidationId -Name 'ValidationId'
     $attemptsRoot = Join-Path $PackageRoot "work/campaigns/$CampaignId/attempts"
     $null = Assert-Phase0EntryControlledPath -ControlledRoot $PackageRoot -Path $attemptsRoot -Expected Directory
+    $null = Assert-Phase0CampaignSecurityPath -Path $attemptsRoot
     $resultDirectories = @()
     foreach ($directory in Get-ChildItem -LiteralPath $attemptsRoot -Force) {
         if (-not $directory.PSIsContainer -or $directory.Name -notmatch '^attempt-([0-9]{4,10})$' -or

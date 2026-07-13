@@ -302,6 +302,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{escaped_entry}', [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -ne 0) {{ throw 'Entry script parse failed' }}
 Import-Module '{escaped_package}' -Force
+function Assert-Phase0CampaignSecurityPath {{ param([string]$Path) return $Path }}
 $required = @('Assert-Phase0EntryIdentifier', 'Assert-Phase0EntryControlledPath', 'Get-Phase0EntryResultsDirectory')
 $definitions = $ast.FindAll({{
     param($node)
@@ -680,6 +681,7 @@ def test_campaign_evidence_directories_use_protected_fail_closed_acl_contract():
     assert "Campaign owner is not trusted" in package
     assert "Ensure-Phase0ProtectedDirectory" in package
     assert "Assert-Phase0CampaignSecurityPath" in entry
+    assert "Assert-Phase0CampaignSecurityPath -Path $attemptsRoot" in entry
 
 
 def test_campaign_acl_denies_unprivileged_read_and_allows_administrator_on_windows(tmp_path):
