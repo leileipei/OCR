@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -48,9 +49,8 @@ def test_package_module_uses_strict_atomic_state_and_refuses_unsafe_ids():
     text = PACKAGE.read_text(encoding="utf-8")
     assert "Set-StrictMode -Version Latest" in text
     assert "$ErrorActionPreference = 'Stop'" in text
-    assert "Move-Item" in text
     assert "[System.IO.File]::Replace" in text
-    assert "Test-Path $FinalPath" in text
+    assert "Test-Path -LiteralPath $FinalPath" in text
     assert "Refusing to overwrite" in text
     assert "AllowedTransitions" in text
     assert "OCR_READY_E10_PENDING" in text
@@ -63,15 +63,42 @@ def test_package_module_uses_strict_atomic_state_and_refuses_unsafe_ids():
     assert "expectedEvidencePrefix" in text
     assert "[Globalization.DateTimeStyles]::RoundtripKind" in text
     assert "Campaign validation IDs must be different" in text
+    assert "Interactive validation ID is already bound" in text
+    assert "Scheduled validation ID is already bound" in text
     assert "[System.Int64]" in text
+    assert "recorded_at_utc" in text
+    assert "EndsWith('Z'" in text
     assert "Get-ChildItem Env:" not in text
 
 
 def test_actions_check_state_before_material_work():
     text = PACKAGE.read_text(encoding="utf-8")
     assert "Assert-Phase0CanTransition" in text
-    assert text.index("-NewState 'PREPARED'") < text.index("$lock = Get-Phase0SupplyLock")
+    assert text.index("-NewState 'PREPARED'") < text.index("$lockValue = Get-Phase0SupplyLock")
     assert text.index("-NewState 'SELF_TEST_PASSED'") < text.index("& \"$root\\runtime\\python\\python.exe\"")
+
+
+def test_runtime_paths_and_attempts_are_reserved_under_campaign_mutex():
+    text = PACKAGE.read_text(encoding="utf-8")
+    assert "Enter-Phase0CampaignLock" in text
+    assert "System.Threading.Mutex" in text
+    assert "FileMode]::CreateNew" in text
+    assert "Get-Phase0DiskAttemptMaximum" in text
+    assert "attempt-reserved.json" in text
+    assert "Assert-Phase0RuntimeLeaf" in text
+    assert "ValidateSet('Missing', 'MissingOrFile', 'File', 'Directory')" in text
+    assert "Assert-Phase0NoReparsePoint" in text
+    assert "Refusing to reuse existing attempt" in text
+
+
+def test_prepare_uses_attempt_staging_and_atomic_campaign_publish():
+    text = PACKAGE.read_text(encoding="utf-8")
+    assert "umi-staging" in text
+    assert "failed-published-umi" in text
+    assert "orphaned-umi" in text
+    assert "[System.IO.Directory]::Move" in text
+    assert "Remove-Phase0OwnedDirectory" in text
+    assert text.index("$attempt = Get-Phase0ActionAttempt") < text.index("& $UmiAsset -y \"-o$UmiRoot\"")
 
 
 def test_package_verification_is_closed_over_exact_safe_file_set():
@@ -82,6 +109,7 @@ def test_package_verification_is_closed_over_exact_safe_file_set():
     assert "duplicate SHA256SUMS path" in text
     assert "malformed SHA256SUMS entry" in text
     assert "SHA256SUMS file set mismatch" in text
+    assert "Runtime work path must be a normal directory" in text
     assert "work" in text
     assert "[System.IO.Path]::IsPathRooted" in text
     assert "GetFullPath" in text
@@ -150,6 +178,98 @@ def test_entrypoint_preserves_the_original_action_error_during_diagnostics():
     assert "$originalError = $_" in text
     assert "-ErrorRecord $originalError" in text
     assert "Write-Error -ErrorRecord $originalError" in text
+
+
+def test_entrypoint_controls_initialization_and_returns_stable_failure():
+    text = ENTRY.read_text(encoding="utf-8")
+    assert text.index("try {") < text.index("Resolve-Path")
+    assert text.index("try {") < text.index("Import-Module")
+    assert "$exitCode = 1" in text
+    assert "exit $exitCode" in text
+    assert "$moduleImported" in text
+
+
+def test_runtime_path_guards_on_windows_when_powershell_is_available(tmp_path):
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if os.name != "nt" or not pwsh:
+        pytest.skip("Windows PowerShell junction behavior requires a Windows host")
+
+    bracket_root = tmp_path / "package[root]"
+    bracket_root.mkdir()
+    script = (
+        f"Import-Module '{PACKAGE}' -Force; "
+        f"$lock = Enter-Phase0CampaignLock -PackageRoot '{bracket_root}' -CampaignId campaign-safe; "
+        "try { $a = Get-Phase0AttemptContext -PackageRoot '"
+        f"{bracket_root}' -CampaignId campaign-safe; "
+        "$b = Get-Phase0AttemptContext -PackageRoot '"
+        f"{bracket_root}' -CampaignId campaign-safe; "
+        "if ($a.number -eq $b.number) { throw 'attempt reused' } } "
+        "finally { Exit-Phase0CampaignLock -Lock $lock }"
+    )
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_attempt_reservation_rejects_windows_junction(tmp_path):
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if os.name != "nt" or not pwsh:
+        pytest.skip("Windows junction behavior requires a Windows host")
+    package_root = tmp_path / "package"
+    attempts = package_root / "work/campaigns/campaign-junction/attempts"
+    attempts.parent.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(attempts), str(outside)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if linked.returncode != 0:
+        pytest.skip("The Windows test account cannot create a junction")
+    command = (
+        f"Import-Module '{PACKAGE}' -Force; "
+        f"Get-Phase0AttemptContext -PackageRoot '{package_root}' "
+        "-CampaignId campaign-junction"
+    )
+    result = subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert not any(outside.iterdir())
+
+
+def test_parallel_attempt_reservations_are_distinct_on_windows(tmp_path):
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if os.name != "nt" or not pwsh:
+        pytest.skip("Cross-process mutex behavior requires a Windows host")
+    package_root = tmp_path / "parallel[root]"
+    package_root.mkdir()
+    command = (
+        f"Import-Module '{PACKAGE}' -Force; "
+        f"$a = Get-Phase0AttemptContext -PackageRoot '{package_root}' "
+        "-CampaignId campaign-parallel; [Console]::Out.WriteLine($a.number)"
+    )
+    processes = [
+        subprocess.Popen(
+            [pwsh, "-NoProfile", "-NonInteractive", "-Command", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    completed = [process.communicate(timeout=45) for process in processes]
+    assert all(process.returncode == 0 for process in processes), completed
+    assert sorted(int(stdout.strip()) for stdout, _ in completed) == [1, 2]
 
 
 def test_module_imports_when_powershell_core_is_available():
