@@ -355,9 +355,9 @@ def test_windows_script_uses_unique_run_and_manifest_contract():
     assert "[string]$ValidationId = ([guid]::NewGuid().ToString('N'))" in script
     assert "validation\\results\\runs" in script
     assert "'validation\\results\\live'" not in script
-    assert "--validation-id $ValidationId" in script
-    assert "--samples-manifest $SamplesManifest" in script
-    assert "--min-pages $MinPages" in script
-    assert "--business-concurrency-limit $BusinessConcurrencyLimit" in script
+    assert "'--validation-id', $ValidationId" in script
+    assert "'--samples-manifest', $SamplesManifest" in script
+    assert "'--min-pages', [string]$MinPages" in script
+    assert "'--business-concurrency-limit', [string]$BusinessConcurrencyLimit" in script
     assert "[int]$BusinessConcurrencyLimit = 5" in script
     assert "[int]$MinPages = 100" in script

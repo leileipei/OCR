@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -9,6 +10,8 @@ import pytest
 ROOT = Path(__file__).parents[1]
 ENTRY = ROOT / "scripts/phase0/Start-Phase0Validation.ps1"
 PACKAGE = ROOT / "scripts/phase0/Phase0.Package.psm1"
+SCHEDULER = ROOT / "scripts/phase0/Phase0.Scheduler.psm1"
+WINDOWS_RUNNER = ROOT / "scripts/run-windows-validation.ps1"
 
 
 def _runtime_scripts_text():
@@ -190,6 +193,116 @@ def test_entrypoint_controls_initialization_and_returns_stable_failure():
     assert "$exitCode = 1" in text
     assert "exit $exitCode" in text
     assert "$moduleImported" in text
+
+
+def test_scheduler_uses_unique_name_and_requires_explicit_cleanup():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    assert "UmiOcrPhase0-$ValidationId" in text
+    assert "Get-Credential" in text
+    assert "-Password $PlainPassword" in text
+    assert "Remove-Phase0ScheduledTask" in text
+    assert "[switch]$ConfirmCleanup" in text
+    assert "Unregister-ScheduledTask" in text
+    assert "-Confirm:$false" in text
+    assert "$ConfirmCleanup" in text
+
+
+def test_scheduler_restricts_argument_file_and_never_persists_credentials():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    assert "SetAccessRuleProtection($true, $false)" in text
+    assert "FileMode]::CreateNew" in text
+    assert "FileSystemAccessRule" in text
+    assert "LocalSystemSid" in text
+    assert "BuiltinAdministratorsSid" in text
+    assert "argument_file_relative" in text
+    for forbidden in ("plain_password", "command_line"):
+        assert forbidden not in text.lower()
+
+
+def test_task_definition_is_password_logon_highest_six_hours_and_dry_run_safe():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    assert "New-Phase0TaskDefinition" in text
+    assert "[switch]$DryRun" in text
+    assert "-LogonType Password" in text
+    assert "-RunLevel Highest" in text
+    assert "New-TimeSpan -Hours 6" in text
+    assert "-ExecutionTimeLimit" in text
+    assert "if ($DryRun)" in text
+    dry_run_body = text.split("if ($DryRun)", 1)[1].split("Register-ScheduledTask", 1)[0]
+    assert "Register-ScheduledTask" not in dry_run_body
+
+
+def test_scheduler_collects_bounded_redacted_evidence_and_reuses_install_attempt():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    assert "Start-Sleep -Seconds 5" in text
+    assert "New-TimeSpan -Hours 6" in text
+    assert "LastTaskResult" in text
+    assert "windows_session_id" in text
+    assert "task_xml_sha256" in text
+    assert "Get-Phase0ExistingSchedule" in text
+    assert "Get-Phase0AttemptContext" in ENTRY.read_text(encoding="utf-8")
+    assert "log_summaries" in text
+    assert "Get-Content -LiteralPath $LogPath" not in text
+    assert "$matches = @()" not in text.lower()
+    assert "SCHEDULED_OCR_FAILED" in text
+    assert "SCHEDULED_OCR_PASSED" in text
+
+
+def test_entrypoint_exposes_dual_run_actions_and_never_logs_secrets():
+    text = ENTRY.read_text(encoding="utf-8")
+    for action in (
+        "RunInteractive",
+        "InstallScheduledTask",
+        "CollectScheduledTask",
+        "RemoveScheduledTask",
+    ):
+        assert action in text
+    lowered = text.lower()
+    assert "write-output $plainpassword" not in lowered
+    assert "get-childitem env:" not in lowered
+    assert "convertfrom-securestring" not in lowered
+
+
+def test_windows_runner_binds_campaign_mode_and_separate_output_directories():
+    text = WINDOWS_RUNNER.read_text(encoding="utf-8")
+    assert "[ValidateSet('Interactive', 'Scheduled')]" in text
+    assert "[string]$ExecutionMode" in text
+    assert "ParameterSetName='Direct')][string]$CampaignId" in text
+    assert "'--campaign-id', $CampaignId" in text
+    assert "'--execution-mode', $ExecutionMode.ToLowerInvariant()" in text
+    assert "Join-Path $RunsRoot ($ExecutionMode.ToLowerInvariant())" in text
+    assert "Assert-Phase0RunnerArguments" in text
+    assert "ValidationId and CampaignId" in text
+
+
+def test_task_definition_dry_run_on_windows_without_registration(tmp_path):
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or not powershell:
+        pytest.skip("ScheduledTasks dry-run parsing requires a Windows host")
+    validation_id = "dryrun-" + tmp_path.name.replace("_", "-")
+    script = (
+        f"Import-Module '{SCHEDULER}' -Force; "
+        f"$d = New-Phase0TaskDefinition -ValidationId '{validation_id}' "
+        "-CommandPath 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' "
+        "-RunnerPath 'C:\\phase0\\run-windows-validation.ps1' "
+        "-ArgumentFile 'C:\\phase0\\scheduled-arguments.json'; "
+        f"if (Get-ScheduledTask -TaskName 'UmiOcrPhase0-{validation_id}' -ErrorAction SilentlyContinue) "
+        "{ throw 'dry run registered a task' }; "
+        "$d | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    definition = json.loads(result.stdout.strip().splitlines()[-1])
+    assert definition["task_name"] == f"UmiOcrPhase0-{validation_id}"
+    assert definition["logon_type"] == "Password"
+    assert definition["run_level"] == "Highest"
+    assert definition["execution_time_limit"] == "PT6H"
+    assert definition["argument_file"] == r"C:\phase0\scheduled-arguments.json"
 
 
 def test_runtime_path_guards_on_windows_when_powershell_is_available(tmp_path):
