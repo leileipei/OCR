@@ -267,7 +267,8 @@ def test_install_and_collect_use_distinct_monotonic_attempts_and_retry_states():
     assert "Only one uncollected scheduled task is allowed per campaign" in text
     assert "'INTERACTIVE_OCR_FAILED'" in text
     assert "'SCHEDULED_OCR_FAILED'" in text
-    assert "-Final $false" in text
+    assert "-Final $false" not in text
+    assert "-Passed $false -Final $true" in text
     assert "Get-Phase0AttemptContext" in text
     allocation_clause = entry.split("if ($Action -in", 1)[1].split("switch ($Action)", 1)[0]
     for initial_action in ("Preflight", "Prepare", "SelfTest"):
@@ -277,6 +278,57 @@ def test_install_and_collect_use_distinct_monotonic_attempts_and_retry_states():
     catch_block = entry.split("catch {", 1)[1]
     assert "InstallScheduledTask'  = 'SCHEDULED_OCR_FAILED'" not in catch_block
     assert "CollectScheduledTask'  = 'SCHEDULED_OCR_FAILED'" not in catch_block
+
+
+def test_scheduler_acl_uses_atomic_mutation_rights_and_protects_attempt_parent():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    verifier = text.split("function Assert-Phase0RestrictedSchedulePath", 1)[1].split(
+        "function New-Phase0RestrictedScheduleDirectory", 1
+    )[0]
+    assert "FileSystemRights]::Modify" not in verifier
+    for right in (
+        "WriteData",
+        "CreateFiles",
+        "AppendData",
+        "CreateDirectories",
+        "WriteExtendedAttributes",
+        "WriteAttributes",
+        "Delete",
+        "DeleteSubdirectoriesAndFiles",
+        "ChangePermissions",
+        "TakeOwnership",
+    ):
+        assert f"FileSystemRights]::{right}" in verifier
+    directory_creator = text.split("function New-Phase0RestrictedScheduleDirectory", 1)[1].split(
+        "function Write-Phase0RestrictedJsonAtomic", 1
+    )[0]
+    assert "SetAccessControl($attemptPath" in directory_creator
+    assert "Assert-Phase0RestrictedSchedulePath -Path $attemptPath" in directory_creator
+
+
+def test_scheduled_failures_and_cleanup_are_terminal_and_auditable():
+    text = SCHEDULER.read_text(encoding="utf-8")
+    entry = ENTRY.read_text(encoding="utf-8")
+    install = text.split("function Install-Phase0ScheduledTask", 1)[1].split(
+        "function Test-Phase0InstalledTaskXml", 1
+    )[0]
+    collect = text.split("function Collect-Phase0ScheduledTask", 1)[1].split(
+        "function Remove-Phase0ScheduledTask", 1
+    )[0]
+    cleanup = text.split("function Remove-Phase0ScheduledTask", 1)[1].split(
+        "Export-ModuleMember", 1
+    )[0]
+    assert "SCHEDULED_TASK_START_FAILED" in install
+    assert "Publish-Phase0ScheduledCollection" in install
+    assert "-Final $true" in collect
+    assert "SCHEDULED_TASK_TIMEOUT" in collect
+    assert "[string]$PackageRoot" in cleanup
+    assert "[string]$CampaignId" in cleanup
+    assert "terminal-cleaned" in cleanup
+    assert "Publish-Phase0ScheduledCollection" in cleanup
+    remove_call = entry.rsplit("'RemoveScheduledTask'", 1)[1].split("}", 1)[0]
+    assert "-PackageRoot $PackageRoot" in remove_call
+    assert "-CampaignId $CampaignId" in remove_call
 
 
 def test_collection_exactly_binds_installed_task_definition():
@@ -363,6 +415,58 @@ def test_windows_runner_binds_campaign_mode_and_separate_output_directories():
     scheduler = SCHEDULER.read_text(encoding="utf-8")
     assert "| Out-Host" in scheduler
     assert "return [int]$exitCode" in scheduler
+
+
+def test_restricted_schedule_acl_round_trip_on_windows(tmp_path):
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if os.name != "nt" or not powershell:
+        pytest.skip("Windows ACL round-trip requires a Windows host")
+    script = f"""
+$module = Import-Module '{SCHEDULER}' -Force -PassThru
+& $module {{
+    param([string]$Root)
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $attemptPath = Join-Path $Root 'attempt'
+    $null = New-Item -ItemType Directory -Path $attemptPath
+    $attempt = [pscustomobject]@{{ root = $attemptPath; number = 1 }}
+    $secure = New-Phase0RestrictedScheduleDirectory -PackageRoot $Root -Attempt $attempt `
+        -ValidationId 'acl-round-trip' -AccountSid $sid
+    $record = Write-Phase0RestrictedJsonAtomic -PackageRoot $Root -Directory $secure `
+        -Name 'arguments.json' -Value ([ordered]@{{ ok = $true }}) -AccountSid $sid
+    $null = Assert-Phase0RestrictedSchedulePath -Path $attemptPath -AccountSid $sid.Value -Kind Directory
+    $null = Assert-Phase0RestrictedSchedulePath -Path $secure -AccountSid $sid.Value -Kind Directory
+    $null = Assert-Phase0RestrictedSchedulePath -Path $record.path -AccountSid $sid.Value -Kind File
+    $original = Get-Acl -LiteralPath $record.path
+    foreach ($right in @(
+        [System.Security.AccessControl.FileSystemRights]::WriteData,
+        [System.Security.AccessControl.FileSystemRights]::Delete,
+        [System.Security.AccessControl.FileSystemRights]::ChangePermissions
+    )) {{
+        $mutated = New-Phase0ScheduleSecurity -AccountSid $sid
+        $bad = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, ([System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor $right),
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $null = $mutated.SetAccessRule($bad)
+        Set-Acl -LiteralPath $record.path -AclObject $mutated
+        try {{
+            $null = Assert-Phase0RestrictedSchedulePath -Path $record.path -AccountSid $sid.Value -Kind File
+            throw "mutation right was accepted: $right"
+        }} catch {{
+            if ($_.Exception.Message -like 'mutation right was accepted:*') {{ throw }}
+        }} finally {{
+            Set-Acl -LiteralPath $record.path -AclObject $original
+        }}
+    }}
+}} '{tmp_path}'
+"""
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_task_definition_dry_run_on_windows_without_registration(tmp_path):

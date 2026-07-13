@@ -59,7 +59,8 @@ try {
             Collect-Phase0ScheduledTask -PackageRoot $PackageRoot -CampaignId $CampaignId -ValidationId $ValidationId
         }
         'RemoveScheduledTask' {
-            Remove-Phase0ScheduledTask -ValidationId $ValidationId -ConfirmCleanup:$ConfirmCleanup
+            Remove-Phase0ScheduledTask -PackageRoot $PackageRoot -CampaignId $CampaignId `
+                -ValidationId $ValidationId -ConfirmCleanup:$ConfirmCleanup
         }
     }
     $exitCode = 0

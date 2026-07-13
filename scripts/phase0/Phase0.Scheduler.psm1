@@ -188,11 +188,19 @@ function Assert-Phase0RestrictedSchedulePath {
             $seenSystem = $true; continue
         }
         if ($null -ne $observedAccount -and $observedAccount -ne $sid) { throw 'Restricted schedule ACL has extra identities' }
-        $writeMask = [System.Security.AccessControl.FileSystemRights]::Write -bor
-            [System.Security.AccessControl.FileSystemRights]::Modify -bor
-            [System.Security.AccessControl.FileSystemRights]::Delete
-        if (($rule.FileSystemRights -band $writeMask) -ne 0 -or
-            ($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) -eq 0) {
+        $mutationMask = [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+            [System.Security.AccessControl.FileSystemRights]::CreateFiles -bor
+            [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+            [System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor
+            [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+            [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+            [System.Security.AccessControl.FileSystemRights]::Delete -bor
+            [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+            [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+        $requiredRead = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+        if (($rule.FileSystemRights -band $mutationMask) -ne 0 -or
+            ($rule.FileSystemRights -band $requiredRead) -ne $requiredRead) {
             throw 'Scheduled execution account must be read-only'
         }
         $observedAccount = $sid
@@ -210,7 +218,10 @@ function New-Phase0RestrictedScheduleDirectory {
     param([string]$PackageRoot, $Attempt, [string]$ValidationId, [System.Security.Principal.SecurityIdentifier]$AccountSid)
     $root = Get-Phase0SchedulerRoot -PackageRoot $PackageRoot
     $attemptRelative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $root -Path $Attempt.root
-    $null = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $attemptRelative
+    $attemptPath = Resolve-Phase0SchedulerPath -PackageRoot $root -RelativePath $attemptRelative
+    $attemptSecurity = New-Phase0ScheduleSecurity -AccountSid $AccountSid -Directory
+    [System.IO.Directory]::SetAccessControl($attemptPath, $attemptSecurity)
+    $null = Assert-Phase0RestrictedSchedulePath -Path $attemptPath -AccountSid $AccountSid.Value -Kind Directory
     $secureRelative = "$attemptRelative/secure"
     $scheduleRelative = "$secureRelative/schedule-$ValidationId"
     foreach ($definition in @(
@@ -419,6 +430,8 @@ function Read-Phase0TrustedRunnerArguments {
         $metadataRecord = Read-Phase0InstallMetadata -PackageRoot $root -MetadataPath $metadataPath
         $metadata = $metadataRecord.value
         $secureParent = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetDirectoryName($trustedArgument))
+        $attemptParent = [System.IO.Path]::GetDirectoryName($secureParent)
+        $null = Assert-Phase0RestrictedSchedulePath -Path $attemptParent -AccountSid $metadata.account_sid -Kind Directory
         $null = Assert-Phase0RestrictedSchedulePath -Path $secureParent -AccountSid $metadata.account_sid -Kind Directory
         $null = Assert-Phase0RestrictedSchedulePath -Path $trustedArgument -AccountSid $metadata.account_sid -Kind File
         if ((Get-Phase0Sha256 -Path $trustedArgument) -ne $metadata.argument_sha256 -or
@@ -587,6 +600,7 @@ function Get-Phase0ScheduleRecords {
         $secure = Join-Path $directory.FullName 'secure'
         if (-not (Test-Path -LiteralPath $secure -PathType Container)) { continue }
         $secureAccount = Assert-Phase0RestrictedSchedulePath -Path $secure -Kind Directory
+        $null = Assert-Phase0RestrictedSchedulePath -Path $directory.FullName -AccountSid $secureAccount -Kind Directory
         foreach ($scheduleDirectory in Get-ChildItem -LiteralPath $secure -Force) {
             if (-not $scheduleDirectory.PSIsContainer) { throw 'Unexpected file in secure schedule root' }
             if ($scheduleDirectory.Name -notmatch '^schedule-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or
@@ -625,6 +639,19 @@ function Get-Phase0PendingSchedule {
     if (-not [string]::IsNullOrWhiteSpace($ValidationId)) { $pending = @($pending | Where-Object { $_.metadata.validation_id -eq $ValidationId }) }
     if ($pending.Count -ne 1) { throw 'Expected exactly one pending scheduled task for the declared validation ID' }
     return $pending[0]
+}
+
+function Move-Phase0InstallMetadataToTerminal {
+    param($Schedule, [ValidateSet('cleaned', 'start-failed')][string]$Reason)
+    $source = [string]$Schedule.metadata_path
+    $directory = [System.IO.Path]::GetDirectoryName($source)
+    $accountSid = Assert-Phase0RestrictedSchedulePath -Path $directory -Kind Directory
+    $null = Assert-Phase0RestrictedSchedulePath -Path $source -AccountSid $accountSid -Kind File
+    $target = Join-Path $directory ("install-terminal-$Reason.json")
+    if (Test-Path -LiteralPath $target) { throw 'Terminal install metadata already exists' }
+    [System.IO.File]::Move($source, $target)
+    $null = Assert-Phase0RestrictedSchedulePath -Path $target -AccountSid $accountSid -Kind File
+    return $target
 }
 
 function Install-Phase0ScheduledTask {
@@ -691,8 +718,29 @@ function Install-Phase0ScheduledTask {
     if (-not (Test-Phase0InstalledTaskXml -PackageRoot $root -Metadata ([pscustomobject]$metadata) -TaskXml $installedXml)) {
         throw 'Installed scheduled task does not match the intended definition'
     }
-    $null = Write-Phase0RestrictedJsonAtomic -PackageRoot $root -Directory $secureDirectory -Name 'install-metadata.json' -Value $metadata -AccountSid $accountSid
-    Start-ScheduledTask -TaskName $TaskName
+    $metadataRecord = Write-Phase0RestrictedJsonAtomic -PackageRoot $root -Directory $secureDirectory -Name 'install-metadata.json' -Value $metadata -AccountSid $accountSid
+    $schedule = [pscustomobject]@{ metadata = [pscustomobject]$metadata; metadata_path = $metadataRecord.path; final = $false }
+    try { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+    catch {
+        $startFailure = $_
+        try {
+            $null = Publish-Phase0ScheduledCollection -PackageRoot $root -CampaignId $CampaignId -Schedule $schedule `
+                -Passed $false -Final $true -LastTaskResult -1 -ValidationErrorCode 'SCHEDULED_TASK_START_FAILED' `
+                -TaskDefinitionValid $true -Configuration $configuration -TaskXmlSha256 $metadata.installed_task_xml_sha256 `
+                -LifecycleStatus 'terminal-start-failed'
+        }
+        catch {
+            if ($_.Exception.Data['Phase0StatePublished']) { throw }
+            try {
+                if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+                    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+                }
+                $null = Move-Phase0InstallMetadataToTerminal -Schedule $schedule -Reason 'start-failed'
+            }
+            catch { throw 'Scheduled task start failed and lifecycle compensation also failed' }
+            throw $startFailure
+        }
+    }
     return $definition
 }
 
@@ -744,11 +792,15 @@ function Publish-Phase0ScheduledCollection {
     param([string]$PackageRoot, [string]$CampaignId, $Schedule, [bool]$Passed, [bool]$Final,
         [int64]$LastTaskResult, [string]$ValidationErrorCode, [bool]$TaskDefinitionValid, $Configuration,
         $Attempt = $null, $WindowsSessionId = $null, [bool]$EvidenceValidationOk = $false,
-        [string]$TaskXmlSha256 = '', [string]$StartedAtUtc = '')
+        [string]$TaskXmlSha256 = '', [string]$StartedAtUtc = '', [string]$LifecycleStatus = '',
+        [bool]$ThrowOnFailure = $true)
     $attempt = $Attempt
     if ($null -eq $attempt) { $attempt = Get-Phase0AttemptContext -PackageRoot $PackageRoot -CampaignId $CampaignId }
     $metadata = $Schedule.metadata
     $stateName = if ($Passed) { 'SCHEDULED_OCR_PASSED' } else { 'SCHEDULED_OCR_FAILED' }
+    if ([string]::IsNullOrWhiteSpace($LifecycleStatus)) {
+        $LifecycleStatus = if (-not $Final) { 'pending-collection-retry' } elseif ($Passed) { 'terminal-passed' } else { 'terminal-failed' }
+    }
     $logs = @()
     if ($null -ne $Configuration) {
         $logs = @(
@@ -764,13 +816,14 @@ function Publish-Phase0ScheduledCollection {
         task_xml_sha256 = $TaskXmlSha256
         evidence_validation_ok = $EvidenceValidationOk; validation_error_code = $ValidationErrorCode
         windows_session_id = $WindowsSessionId
-        log_summaries = $logs; final = $Final; state = $stateName; result = if ($Passed) { 'passed' } else { 'failed' }
+        log_summaries = $logs; final = $Final; lifecycle_status = $LifecycleStatus
+        state = $stateName; result = if ($Passed) { 'passed' } else { 'failed' }
     }
     $path = Write-Phase0SchedulerJson -PackageRoot $PackageRoot -Path (Join-Path $attempt.root 'scheduled-collection.json') -Value $summary
     $relative = ConvertTo-Phase0SchedulerRelativePath -PackageRoot $PackageRoot -Path $path
     $null = Set-Phase0State -PackageRoot $PackageRoot -CampaignId $CampaignId -NewState $stateName -Attempt $attempt.number `
         -EvidenceRelativePath $relative -ValidationKind Scheduled -ValidationId $metadata.validation_id
-    if (-not $Passed) { throw (New-Phase0PublishedFailure 'Scheduled OCR validation failed') }
+    if (-not $Passed -and $ThrowOnFailure) { throw (New-Phase0PublishedFailure 'Scheduled OCR validation failed') }
     return [pscustomobject]$summary
 }
 
@@ -799,7 +852,7 @@ function Collect-Phase0ScheduledTask {
         if ([string]$task.State -notin @('Running', 'Queued') -and $hasStarted) { break }
         if ([DateTime]::UtcNow -ge $deadline) {
             $timeoutResult = Publish-Phase0ScheduledCollection -PackageRoot $PackageRoot -CampaignId $CampaignId -Schedule $schedule `
-                -Passed $false -Final $false -LastTaskResult ([int64]$taskInfo.LastTaskResult) `
+                -Passed $false -Final $true -LastTaskResult ([int64]$taskInfo.LastTaskResult) `
                 -ValidationErrorCode 'SCHEDULED_TASK_TIMEOUT' -TaskDefinitionValid $false -Configuration $null
             return $timeoutResult
         }
@@ -837,11 +890,30 @@ function Collect-Phase0ScheduledTask {
 }
 
 function Remove-Phase0ScheduledTask {
-    param([string]$ValidationId, [switch]$ConfirmCleanup)
+    param([string]$PackageRoot, [string]$CampaignId, [string]$ValidationId, [switch]$ConfirmCleanup)
     if (-not $ConfirmCleanup) { throw 'ConfirmCleanup is required' }
     Assert-Phase0SchedulerIdentifier -Value $ValidationId -Name ValidationId
+    $schedules = @(Get-Phase0ScheduleRecords -PackageRoot $PackageRoot -CampaignId $CampaignId | Where-Object {
+        $_.metadata.validation_id -eq $ValidationId
+    })
+    if ($schedules.Count -lt 1) { throw 'No scheduled-task lifecycle record exists for cleanup' }
+    $pending = @($schedules | Where-Object { -not $_.final })
+    if ($pending.Count -gt 1) { throw 'Only one uncollected scheduled task is allowed per campaign' }
     $TaskName = "UmiOcrPhase0-$ValidationId"
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    $null = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+    if ($pending.Count -eq 1) {
+        try {
+            return Publish-Phase0ScheduledCollection -PackageRoot $PackageRoot -CampaignId $CampaignId -Schedule $pending[0] `
+                -Passed $false -Final $true -LastTaskResult -1 -ValidationErrorCode 'SCHEDULED_TASK_CLEANED' `
+                -TaskDefinitionValid $false -Configuration $null -LifecycleStatus 'terminal-cleaned' -ThrowOnFailure $false
+        }
+        catch {
+            $null = Move-Phase0InstallMetadataToTerminal -Schedule $pending[0] -Reason 'cleaned'
+            throw
+        }
+    }
+    return [pscustomobject]@{ validation_id = $ValidationId; lifecycle_status = 'terminal-cleaned'; final = $true }
 }
 
 Export-ModuleMember -Function @(
