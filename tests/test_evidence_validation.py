@@ -1,11 +1,35 @@
 import json
 import os
+from types import SimpleNamespace
 
 import pytest
 
 import umi_web_spike.evidence_validation as evidence_validation_module
 from tests.evidence_fixtures import write_evidence
 from umi_web_spike.evidence_validation import validate_ocr_evidence
+
+
+def test_stable_file_mutation_fingerprint_ignores_ctime_representation():
+    before = SimpleNamespace(
+        st_size=128,
+        st_mtime=10.0,
+        st_mtime_ns=10_000_000_000,
+        st_ctime=20.0,
+        st_ctime_ns=20_000_000_000,
+    )
+    same_file_from_other_windows_api = SimpleNamespace(
+        st_size=128,
+        st_mtime=10.0,
+        st_mtime_ns=10_000_000_000,
+        st_ctime=21.0,
+        st_ctime_ns=21_000_000_000,
+    )
+
+    assert evidence_validation_module._StableRegularFile._content_fingerprint(
+        before
+    ) == evidence_validation_module._StableRegularFile._content_fingerprint(
+        same_file_from_other_windows_api
+    )
 
 
 def _symlink_or_skip(link, target, target_is_directory=False):

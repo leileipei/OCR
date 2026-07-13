@@ -63,7 +63,6 @@ class _StableRegularFile:
         return (
             info.st_size,
             getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000)),
-            getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000)),
         )
 
     def __enter__(self):

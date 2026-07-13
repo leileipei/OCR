@@ -697,6 +697,9 @@ def test_campaign_evidence_directories_use_protected_fail_closed_acl_contract():
     assert "Ensure-Phase0ProtectedDirectory" in package
     assert "Assert-Phase0CampaignSecurityPath" in entry
     assert "Assert-Phase0CampaignSecurityPath -Path $attemptsRoot" in entry
+    assert "[System.IO.FileSystemAclExtensions]::Create(" in package
+    assert "New-Object System.IO.DirectoryInfo($target)" in package
+    assert "[System.IO.Directory]::CreateDirectory($target, $security)" not in package
 
 
 def test_campaign_acl_denies_unprivileged_read_and_allows_administrator_on_windows(tmp_path):

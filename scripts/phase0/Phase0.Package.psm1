@@ -249,7 +249,8 @@ function Ensure-Phase0ProtectedDirectory {
     }
     if (-not [System.IO.Directory]::Exists($target)) {
         $security = New-Phase0CampaignSecurity
-        $null = [System.IO.Directory]::CreateDirectory($target, $security)
+        $directoryInfo = New-Object System.IO.DirectoryInfo($target)
+        $null = [System.IO.FileSystemAclExtensions]::Create($directoryInfo, $security)
     }
     Assert-Phase0NoReparsePoint -Root $root -Candidate $target
     $null = Assert-Phase0CampaignSecurityPath -Path $target -AllowedReadOnlySid $AllowedReadOnlySid
