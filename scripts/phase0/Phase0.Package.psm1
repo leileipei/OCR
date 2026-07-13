@@ -250,7 +250,44 @@ function Ensure-Phase0ProtectedDirectory {
     if (-not [System.IO.Directory]::Exists($target)) {
         $security = New-Phase0CampaignSecurity
         $directoryInfo = New-Object System.IO.DirectoryInfo($target)
-        $null = [System.IO.FileSystemAclExtensions]::Create($directoryInfo, $security)
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $desktopCreate = @(
+                $directoryInfo.GetType().GetMethods() | Where-Object {
+                    $parameters = @($_.GetParameters())
+                    $_.Name -eq 'Create' -and
+                        -not $_.IsStatic -and
+                        $parameters.Count -eq 1 -and
+                        $parameters[0].ParameterType.FullName -eq 'System.Security.AccessControl.DirectorySecurity'
+                }
+            )
+            if ($desktopCreate.Count -ne 1) {
+                throw 'DirectoryInfo.Create(DirectorySecurity) is unavailable'
+            }
+            $null = (New-Object System.IO.DirectoryInfo($target)).Create($security)
+        }
+        elseif ($PSVersionTable.PSEdition -eq 'Core') {
+            $aclExtensionType = 'System.IO.FileSystemAclExtensions' -as [type]
+            $coreCreate = @()
+            if ($null -ne $aclExtensionType) {
+                $coreCreate = @(
+                    $aclExtensionType.GetMethods() | Where-Object {
+                        $parameters = @($_.GetParameters())
+                        $_.Name -eq 'Create' -and
+                            $_.IsStatic -and
+                            $parameters.Count -eq 2 -and
+                            $parameters[0].ParameterType.FullName -eq 'System.IO.DirectoryInfo' -and
+                            $parameters[1].ParameterType.FullName -eq 'System.Security.AccessControl.DirectorySecurity'
+                    }
+                )
+            }
+            if ($coreCreate.Count -ne 1) {
+                throw 'FileSystemAclExtensions.Create is unavailable'
+            }
+            $null = [System.IO.FileSystemAclExtensions]::Create($directoryInfo, $security)
+        }
+        else {
+            throw "Unsupported PowerShell edition for protected ACL creation: $($PSVersionTable.PSEdition)"
+        }
     }
     Assert-Phase0NoReparsePoint -Root $root -Candidate $target
     $null = Assert-Phase0CampaignSecurityPath -Path $target -AllowedReadOnlySid $AllowedReadOnlySid

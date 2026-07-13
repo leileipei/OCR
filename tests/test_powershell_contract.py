@@ -689,6 +689,9 @@ def test_windows_runner_binds_campaign_mode_and_separate_output_directories():
 def test_campaign_evidence_directories_use_protected_fail_closed_acl_contract():
     package = PACKAGE.read_text(encoding="utf-8")
     entry = ENTRY.read_text(encoding="utf-8")
+    creator = package.split("function Ensure-Phase0ProtectedDirectory", 1)[1].split(
+        "function Assert-Phase0EvidenceTree", 1
+    )[0]
     assert "function New-Phase0CampaignSecurity" in package
     assert "SetAccessRuleProtection($true, $false)" in package
     assert "function Assert-Phase0CampaignSecurityPath" in package
@@ -697,15 +700,26 @@ def test_campaign_evidence_directories_use_protected_fail_closed_acl_contract():
     assert "Ensure-Phase0ProtectedDirectory" in package
     assert "Assert-Phase0CampaignSecurityPath" in entry
     assert "Assert-Phase0CampaignSecurityPath -Path $attemptsRoot" in entry
-    assert "[System.IO.FileSystemAclExtensions]::Create(" in package
-    assert "New-Object System.IO.DirectoryInfo($target)" in package
-    assert "[System.IO.Directory]::CreateDirectory($target, $security)" not in package
+    assert "$PSVersionTable.PSEdition -eq 'Desktop'" in creator
+    assert "$PSVersionTable.PSEdition -eq 'Core'" in creator
+    assert "(New-Object System.IO.DirectoryInfo($target)).Create($security)" in creator
+    assert "DirectoryInfo.Create(DirectorySecurity) is unavailable" in creator
+    assert "[System.IO.FileSystemAclExtensions]::Create($directoryInfo, $security)" in creator
+    assert "FileSystemAclExtensions.Create is unavailable" in creator
+    assert "Unsupported PowerShell edition for protected ACL creation" in creator
+    assert "[System.IO.Directory]::CreateDirectory($target, $security)" not in creator
+    assert "Set-Acl" not in creator
 
 
-def test_campaign_acl_denies_unprivileged_read_and_allows_administrator_on_windows(tmp_path):
-    powershell = shutil.which("powershell") or shutil.which("pwsh")
-    if os.name != "nt" or not powershell:
+@pytest.mark.parametrize("engine_name", ["powershell", "pwsh"])
+def test_campaign_acl_denies_unprivileged_read_and_allows_administrator_on_windows(
+    tmp_path, engine_name
+):
+    if os.name != "nt":
         pytest.skip("Windows campaign ACL behavior requires a Windows host")
+    powershell = shutil.which(engine_name)
+    if not powershell:
+        pytest.skip(f"{engine_name} is not installed")
     script = rf"""
 $userName = 'UmiEvidence' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $root = Join-Path $env:ProgramData ('UmiOcrEvidenceAcl-' + [guid]::NewGuid().ToString('N'))
