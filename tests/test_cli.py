@@ -124,12 +124,22 @@ def test_validate_ocr_returns_one_when_qt_module_is_loaded(tmp_path, monkeypatch
     assert resources["details"]["qt_loaded"] is True
 
 
-def test_windows_script_uses_explicit_python_and_project_root():
+def test_windows_script_separates_test_and_plugin_python_at_project_root():
     script = (PROJECT_ROOT / "scripts" / "run-windows-validation.ps1").read_text(
         encoding="utf-8"
     )
 
+    assert "[Parameter(Mandatory=$true)][string]$TestPythonExe" in script
     assert "Push-Location $ProjectRoot" in script
-    assert "& $PythonExe -m pytest -q" in script
+    assert "& $TestPythonExe -m pytest -q" in script
+    assert "& $PythonExe -m pytest -q" not in script
+    assert script.count("& $PythonExe -m umi_web_spike.cli validate-ocr") == 1
     assert "Pop-Location" in script
     assert "Join-Path $ProjectRoot 'validation\\results\\live'" in script
+
+    samples_readme = (PROJECT_ROOT / "validation" / "samples" / "README.md").read_text(
+        encoding="utf-8"
+    )
+    assert "TestPythonExe" in samples_readme
+    assert "PythonExe" in samples_readme
+    assert "两个独立" in samples_readme

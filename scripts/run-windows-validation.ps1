@@ -1,6 +1,7 @@
 param(
   [string]$ProjectRoot = (Resolve-Path ".").Path,
   [Parameter(Mandatory=$true)][string]$UmiDataRoot,
+  [Parameter(Mandatory=$true)][string]$TestPythonExe,
   [Parameter(Mandatory=$true)][string]$PythonExe,
   [Parameter(Mandatory=$true)][string]$PluginRoot,
   [Parameter(Mandatory=$true)][string]$PluginName,
@@ -18,7 +19,7 @@ $ExitCode = 0
 $env:PYTHONPATH = "$ProjectRoot\src;$UmiDataRoot\py_src\imports;$UmiDataRoot\site-packages"
 Push-Location $ProjectRoot
 try {
-  & $PythonExe -m pytest -q
+  & $TestPythonExe -m pytest -q
   if ($LASTEXITCODE -ne 0) {
     $ExitCode = $LASTEXITCODE
   } else {
