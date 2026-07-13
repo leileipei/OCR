@@ -213,3 +213,88 @@ def test_build_workflow_artifact_is_an_exact_publication_allowlist():
     assert "downloads/" not in text
     assert "work/" not in text
     assert "*" not in "\n".join(paths)
+
+
+def test_release_workflow_is_tag_only_draft_with_least_privilege():
+    text = _read_workflow("release-offline-package.yml")
+    assert re.search(
+        r"(?m)^on:\n  push:\n    tags:\n      - 'offline-v\*'$",
+        text,
+    )
+    for forbidden_trigger in ("workflow_dispatch:", "pull_request:", "branches:"):
+        assert forbidden_trigger not in text
+    permission_block = re.search(
+        r"(?ms)^permissions:\n(?P<body>(?:  [^\n]+\n)+)\n",
+        text,
+    )
+    assert permission_block is not None
+    assert permission_block.group("body").splitlines() == ["  contents: write"]
+    assert "--draft" in text
+    assert "--verify-tag" in text
+    assert "gh release edit" not in text
+    assert "--latest" not in text
+    assert "if: always()" not in text
+
+
+def test_release_workflow_builds_on_windows_and_gates_release_after_validation():
+    text = _read_workflow("release-offline-package.yml")
+    checkout = "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5"
+    setup = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
+    assert "runs-on: windows-latest" in text
+    assert checkout in text and setup in text
+    uses = re.findall(r"(?m)^\s+- uses: ([^\s]+)$", text)
+    assert uses == [checkout, setup]
+    assert "python-version: '3.12.10'" in text
+    assert "python -m pytest -q" in text
+    assert "scripts/build-offline-package.ps1" in text
+    assert "BUILT_OFFLINE_PACKAGE" in text
+    assert "tests/test_offline_package.py" in text
+    assert "0 skipped" in text
+    assert "Get-FileHash" in text
+    assert "sbom.json" in text and "ConvertFrom-Json" in text
+    assert "THIRD_PARTY_NOTICES.txt" in text
+    assert "gh release create $env:GITHUB_REF_NAME" in text
+    required_order = [
+        "python -m pytest -q",
+        "scripts/build-offline-package.ps1",
+        "$env:BUILT_OFFLINE_PACKAGE",
+        "Get-FileHash",
+        "ConvertFrom-Json",
+        "gh release create $env:GITHUB_REF_NAME",
+    ]
+    positions = [text.index(value) for value in required_order]
+    assert positions == sorted(positions)
+
+
+def test_release_workflow_publishes_exactly_five_allowlisted_assets():
+    text = _read_workflow("release-offline-package.yml")
+    command = text[text.index("gh release create $env:GITHUB_REF_NAME") :]
+    assets = re.findall(
+        r"(?m)^\s+(dist/[^\s`]+|docs/validation/README-release\.md)\s+`?$",
+        command,
+    )
+    assert assets == [
+        "dist/umi-ocr-phase0-offline-rapid-v2.1.5-tool-v0.2.0.zip",
+        "dist/umi-ocr-phase0-offline-rapid-v2.1.5-tool-v0.2.0.zip.sha256",
+        "dist/sbom.json",
+        "dist/THIRD_PARTY_NOTICES.txt",
+        "docs/validation/README-release.md",
+    ]
+    assert "work/" not in text
+    assert "downloads/" not in text
+
+
+def test_release_readme_states_integrity_requirements_and_phase_boundaries():
+    text = (ROOT / "docs/validation/README-release.md").read_text(encoding="utf-8")
+    assert "未经修改" in text
+    assert "Umi-OCR Rapid v2.1.5" in text
+    assert "659c55896c32a5e019dc7bde1713d0e5c73186a2c653bed84c4480fa1795b722" in text
+    assert "Get-FileHash" in text
+    assert "umi-ocr-phase0-offline-rapid-v2.1.5-tool-v0.2.0.zip.sha256" in text
+    assert all(value in text for value in ("Windows Server x64", "PowerShell 5.1", "管理员"))
+    assert "六类" in text and "脱敏样本" in text and "不随包提供" in text
+    assert "E10" in text and "未包含" in text
+    assert "OCR_READY_E10_PENDING" in text
+    assert "Draft Release" in text
+    assert "不是生产发布" in text
+    assert "不是 Phase 0 通过证明" in text
