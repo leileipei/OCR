@@ -14,6 +14,42 @@ SCHEDULER = ROOT / "scripts/phase0/Phase0.Scheduler.psm1"
 WINDOWS_RUNNER = ROOT / "scripts/run-windows-validation.ps1"
 
 
+def _powershell_expected_rejection(command, expected_message, message_prefix=False):
+    escaped_message = expected_message.replace("'", "''")
+    matches_expected = (
+        "$_.Exception.Message.StartsWith("
+        f"'{escaped_message}', [StringComparison]::Ordinal)"
+        if message_prefix
+        else f"$_.Exception.Message -ceq '{escaped_message}'"
+    )
+    return (
+        f"try {{ {command} }} catch {{ "
+        f"if ({matches_expected}) {{ exit 0 }}; "
+        "[Console]::Error.WriteLine(('Unexpected rejection: ' + "
+        "$_.Exception.GetType().FullName + ': ' + $_.Exception.Message)); exit 1 }; "
+        "[Console]::Error.WriteLine('Expected rejection did not occur'); exit 1"
+    )
+
+
+def test_expected_rejection_harness_has_deterministic_exit_and_reason_contract():
+    script = _powershell_expected_rejection(
+        "Invoke-Guard",
+        "guard rejected the untrusted input",
+    )
+    assert "Invoke-Guard" in script
+    assert "guard rejected the untrusted input" in script
+    assert "Unexpected rejection" in script
+    assert "Expected rejection did not occur" in script
+    assert "exit 0" in script
+    assert script.endswith("exit 1")
+    prefix_script = _powershell_expected_rejection(
+        "Invoke-Guard",
+        "guard rejected:",
+        message_prefix=True,
+    )
+    assert ".StartsWith('guard rejected:', [StringComparison]::Ordinal)" in prefix_script
+
+
 def _runtime_scripts_text():
     return "\n".join(
         path.read_text(encoding="utf-8")
@@ -637,7 +673,7 @@ $module = Import-Module '{SCHEDULER}' -Force -PassThru
         }}
         throw 'administrator runner token was accepted'
     }} catch {{
-        if ($_.Exception.Message -eq 'administrator runner token was accepted') {{ throw }}
+        if ($_.Exception.Message -cne 'Scheduled runner must not execute with an Administrators token') {{ throw }}
     }}
     $paths = & $module {{
         param([string]$Root, $Sid)
@@ -704,7 +740,7 @@ exit 0
         $null = & $module {{ param($Credential, $Sid) Assert-Phase0ScheduledCredentialNonAdministrator -Credential $Credential -ExpectedSid $Sid }} $credential $sid
         throw 'administrator credential was accepted'
     }} catch {{
-        if ($_.Exception.Message -eq 'administrator credential was accepted') {{ throw }}
+        if ($_.Exception.Message -cne 'Scheduled execution account must not belong to BUILTIN\Administrators') {{ throw }}
     }}
 }}
 catch {{
@@ -777,12 +813,17 @@ try {{
         $taskName = 'UmiOcrPhase0-' + $validation
         $createdTasks += $taskName
         & $module {{ param([int]$Number) $script:CompensationTestAttempt = $Number }} $definition.number
+        $expectedFault = switch ($definition.stage) {{
+            'Export' {{ 'Injected export failure' }}
+            'Xml' {{ 'Injected XML validation failure' }}
+            'Metadata' {{ 'Injected metadata publish failure' }}
+        }}
         try {{
             Install-Phase0ScheduledTask -PackageRoot $root -CampaignId $campaign -ValidationId $validation `
                 -Credential $credential -FaultInjection $definition.stage
             throw 'fault injection unexpectedly completed'
         }} catch {{
-            if ($_.Exception.Message -eq 'fault injection unexpectedly completed') {{ throw }}
+            if ($_.Exception.Message -cne $expectedFault) {{ throw }}
         }}
         if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {{ throw 'fault left an orphan task' }}
         $attemptRoot = Join-Path $root ("work\campaigns\$campaign\attempts\attempt-" + ('{{0:D4}}' -f $definition.number))
@@ -929,12 +970,11 @@ def test_runner_relationship_guard_rejects_arbitrary_python_on_windows(tmp_path)
         "validation_id": validation_id,
     }
     serialized = json.dumps(configuration).replace("'", "''")
-    script = (
-        f"Import-Module '{SCHEDULER}' -Force; "
-        f"$c = '{serialized}' | ConvertFrom-Json; "
-        f"try {{ Assert-Phase0RunnerConfiguration -PackageRoot '{tmp_path}' -Configuration $c; "
-        "throw 'arbitrary executable accepted' } catch { "
-        "if ($_.Exception.Message -eq 'arbitrary executable accepted') { throw } }"
+    script = f"Import-Module '{SCHEDULER}' -Force; $c = '{serialized}' | ConvertFrom-Json; " + (
+        _powershell_expected_rejection(
+            f"Assert-Phase0RunnerConfiguration -PackageRoot '{tmp_path}' -Configuration $c",
+            "python_exe is outside the trusted package relationship",
+        )
     )
     result = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
@@ -958,12 +998,12 @@ def test_runner_relationship_guard_rejects_arbitrary_python_on_windows(tmp_path)
     if linked.returncode != 0:
         pytest.skip("The Windows test account cannot create an output junction")
     serialized = json.dumps(configuration).replace("'", "''")
-    script = (
-        f"Import-Module '{SCHEDULER}' -Force; "
-        f"$c = '{serialized}' | ConvertFrom-Json; "
-        f"try {{ Assert-Phase0RunnerConfiguration -PackageRoot '{tmp_path}' -Configuration $c; "
-        "throw 'output junction accepted' } catch { "
-        "if ($_.Exception.Message -eq 'output junction accepted') { throw } }"
+    script = f"Import-Module '{SCHEDULER}' -Force; $c = '{serialized}' | ConvertFrom-Json; " + (
+        _powershell_expected_rejection(
+            f"Assert-Phase0RunnerConfiguration -PackageRoot '{tmp_path}' -Configuration $c",
+            "Runtime path contains a reparse point:",
+            message_prefix=True,
+        )
     )
     result = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
