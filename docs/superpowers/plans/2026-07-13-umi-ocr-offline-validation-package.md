@@ -127,7 +127,7 @@ def test_tree_sums_reject_tampered_or_unlisted_files(tmp_path):
 
 - [ ] **Step 2: 运行测试并确认模块不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_package_integrity.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_package_integrity.py -v`
 Expected: FAIL，包含 `ModuleNotFoundError: No module named 'umi_web_spike.package_integrity'`。
 
 - [ ] **Step 3: 创建精确锁文件**
@@ -313,9 +313,9 @@ def verify_sha256sums(root, sums_path) -> None:
 
 - [ ] **Step 6: 运行聚焦和全量测试**
 
-Run: `.venv/bin/python -m pytest tests/test_package_integrity.py -v`  
-Expected: 3 passed。  
-Run: `.venv/bin/python -m pytest -q`  
+Run: `.venv/bin/python -m pytest tests/test_package_integrity.py -v`
+Expected: 3 passed。
+Run: `.venv/bin/python -m pytest -q`
 Expected: 100 passed，0 failed。
 
 - [ ] **Step 7: 提交 Task 1**
@@ -376,7 +376,7 @@ def test_interactive_and_scheduled_session_rules_are_distinct(tmp_path):
 
 - [ ] **Step 2: 运行测试并确认接口不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_evidence_validation.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_evidence_validation.py -v`
 Expected: FAIL，包含 `No module named 'umi_web_spike.evidence_validation'`。
 
 - [ ] **Step 3: 把现有 OCR 验证逻辑搬到独立模块**
@@ -424,7 +424,7 @@ def validate_ocr_evidence(results_dir: Path, expected_mode: str) -> OcrEvidenceV
 
 - [ ] **Step 4: 运行聚焦测试和报告回归**
 
-Run: `.venv/bin/python -m pytest tests/test_evidence_validation.py tests/test_cli.py tests/test_report.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_evidence_validation.py tests/test_cli.py tests/test_report.py -v`
 Expected: 新增 3 项与所有现有 CLI/报告测试通过，0 failed。
 
 - [ ] **Step 5: 提交 Task 2**
@@ -507,7 +507,7 @@ def test_review_bundle_rejects_failed_or_cross_run_input(tmp_path):
 
 - [ ] **Step 2: 运行测试并确认模块不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_readiness.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_readiness.py -v`
 Expected: FAIL，包含 `No module named 'umi_web_spike.readiness'`。
 
 - [ ] **Step 3: 实现严格的 OCR-only 结果与审核包**
@@ -619,9 +619,9 @@ review.add_argument("--output", required=True)
 
 - [ ] **Step 5: 运行聚焦和全量测试**
 
-Run: `.venv/bin/python -m pytest tests/test_readiness.py tests/test_cli.py -v`  
-Expected: 0 failed。  
-Run: `.venv/bin/python -m pytest -q`  
+Run: `.venv/bin/python -m pytest tests/test_readiness.py tests/test_cli.py -v`
+Expected: 0 failed。
+Run: `.venv/bin/python -m pytest -q`
 Expected: 0 failed。
 
 - [ ] **Step 6: 提交 Task 3**
@@ -681,7 +681,7 @@ def test_package_module_uses_atomic_state_and_refuses_overwrite():
 
 - [ ] **Step 2: 运行测试并确认脚本不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py -v`
 Expected: FAIL，包含 `FileNotFoundError`。
 
 - [ ] **Step 3: 实现 Phase0.Package.psm1 的状态与原子写入**
@@ -718,9 +718,9 @@ function Write-AtomicUtf8Json {
 
 - [ ] **Step 4: 实现三个动作**
 
-`Test-Phase0Package`：逐行解析 `SHA256SUMS.txt`，使用 `Get-FileHash -Algorithm SHA256` 复算，拒绝缺文件、多余文件和摘要不一致；只忽略运行时创建的整个 `work/` 子树，其他未列入文件一律失败。  
-`Invoke-Phase0Preflight`：验证 64 位 Windows Server、PowerShell >= 5.1、管理员身份、可用磁盘 >= 5GB、包路径不含控制字符、所有清单文件通过；输出 `preflight.json`。  
-`Invoke-Phase0Prepare`：再次校验 Umi 官方摘要，解压到形如 `work/campaigns/campaign-20260713-001/umi` 的 campaign 目录。实际命令固定为 `& $UmiAsset -y "-o$UmiRoot"`；完成后依据 lock 中 `umi_layout` 精确确认 `Umi-OCR_Rapid_v2.1.5/UmiOCR-data/runtime/python.exe`、`UmiOCR-data/plugins` 和插件目录 `win7_x64_RapidOCR-json` 存在；输出 `run-context.json`。  
+`Test-Phase0Package`：逐行解析 `SHA256SUMS.txt`，使用 `Get-FileHash -Algorithm SHA256` 复算，拒绝缺文件、多余文件和摘要不一致；只忽略运行时创建的整个 `work/` 子树，其他未列入文件一律失败。
+`Invoke-Phase0Preflight`：验证 64 位 Windows Server、PowerShell >= 5.1、管理员身份、可用磁盘 >= 5GB、包路径不含控制字符、所有清单文件通过；输出 `preflight.json`。
+`Invoke-Phase0Prepare`：再次校验 Umi 官方摘要，解压到形如 `work/campaigns/campaign-20260713-001/umi` 的 campaign 目录。实际命令固定为 `& $UmiAsset -y "-o$UmiRoot"`；完成后依据 lock 中 `umi_layout` 精确确认 `Umi-OCR_Rapid_v2.1.5/UmiOCR-data/runtime/python.exe`、`UmiOCR-data/plugins` 和插件目录 `win7_x64_RapidOCR-json` 存在；输出 `run-context.json`。
 `Invoke-Phase0SelfTest`：执行：
 
 ```powershell
@@ -759,9 +759,9 @@ try {
 
 - [ ] **Step 6: 在可用平台运行测试**
 
-Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py -v`  
-Expected: 静态契约通过。  
-Windows Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0/Start-Phase0Validation.ps1 -Action Preflight -PackageRoot "$env:TEMP\umi-phase0-fixture" -CampaignId campaign-preflight-ci-001`  
+Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py -v`
+Expected: 静态契约通过。
+Windows Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/phase0/Start-Phase0Validation.ps1 -Action Preflight -PackageRoot "$env:TEMP\umi-phase0-fixture" -CampaignId campaign-preflight-ci-001`
 Expected: fixture 完整时 exit 0；篡改时 exit 1。
 
 - [ ] **Step 7: 提交 Task 4**
@@ -811,7 +811,7 @@ def test_entrypoint_never_logs_password_or_full_environment():
 
 - [ ] **Step 2: 运行测试并确认模块不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py -v`
 Expected: FAIL，包含 `Phase0.Scheduler.psm1` 不存在。
 
 - [ ] **Step 3: 实现计划任务定义与凭据边界**
@@ -847,7 +847,7 @@ function Install-Phase0ScheduledTask {
 
 - [ ] **Step 4: 实现收集和显式清理**
 
-`Collect-Phase0ScheduledTask` 每 5 秒轮询任务，最长 6 小时；记录开始/结束 UTC、`LastTaskResult`、Session ID、任务 XML SHA-256、标准输出和错误日志的清理摘要。非零 `LastTaskResult` 转入 `SCHEDULED_OCR_FAILED`。  
+`Collect-Phase0ScheduledTask` 每 5 秒轮询任务，最长 6 小时；记录开始/结束 UTC、`LastTaskResult`、Session ID、任务 XML SHA-256、标准输出和错误日志的清理摘要。非零 `LastTaskResult` 转入 `SCHEDULED_OCR_FAILED`。
 `Remove-Phase0ScheduledTask` 的签名固定为：
 
 ```powershell
@@ -861,13 +861,13 @@ function Remove-Phase0ScheduledTask {
 
 - [ ] **Step 5: 扩展入口和现有 OCR 脚本**
 
-入口 `ValidateSet` 增加 `RunInteractive`、`InstallScheduledTask`、`CollectScheduledTask`、`RemoveScheduledTask`。  
+入口 `ValidateSet` 增加 `RunInteractive`、`InstallScheduledTask`、`CollectScheduledTask`、`RemoveScheduledTask`。
 `run-windows-validation.ps1` 增加必填 `-ExecutionMode Interactive|Scheduled`，把模式写入 manifest 安全环境摘要；两个模式必须生成不同 validation ID 和目录。
 
 - [ ] **Step 6: 运行聚焦测试和 Windows DryRun**
 
-Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py tests/test_cli.py -v`  
-Expected: 0 failed。  
+Run: `.venv/bin/python -m pytest tests/test_powershell_contract.py tests/test_cli.py -v`
+Expected: 0 failed。
 Windows DryRun: 调用 `New-Phase0TaskDefinition` 生成定义但不注册，断言任务名、6 小时限制、无登录运行配置和参数文件路径正确。
 
 - [ ] **Step 7: 提交 Task 5**
@@ -928,7 +928,7 @@ def test_runbook_keeps_e10_as_a_hard_gate():
 
 - [ ] **Step 2: 运行测试并确认模板不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_offline_docs.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_offline_docs.py -v`
 Expected: FAIL，包含 `FileNotFoundError`。
 
 - [ ] **Step 3: 创建固定模板**
@@ -998,9 +998,9 @@ exit $LASTEXITCODE
 
 - [ ] **Step 6: 运行文档和全量测试**
 
-Run: `.venv/bin/python -m pytest tests/test_offline_docs.py tests/test_powershell_contract.py -v`  
-Expected: 0 failed。  
-Run: `.venv/bin/python -m pytest -q`  
+Run: `.venv/bin/python -m pytest tests/test_offline_docs.py tests/test_powershell_contract.py -v`
+Expected: 0 failed。
+Run: `.venv/bin/python -m pytest -q`
 Expected: 0 failed。
 
 - [ ] **Step 7: 提交 Task 6**
@@ -1088,7 +1088,7 @@ def test_package_manifest_excludes_work_and_sensitive_files():
 
 - [ ] **Step 2: 运行测试并确认构建器不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_offline_package.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_offline_package.py -v`
 Expected: FAIL，因为 `scripts/build-offline-package.ps1` 尚不存在。
 
 - [ ] **Step 3: 实现下载缓存与严格验证**
@@ -1162,9 +1162,9 @@ import site
 
 - [ ] **Step 6: 在 Windows 运行真实构建和成品断言**
 
-Real Run: `powershell -File scripts/build-offline-package.ps1`  
-Expected: 下载并校验 103369422 字节 Umi 资产、11133606 字节 Python 资产和 9 个 wheels；便携运行时全套 pytest 通过；生成 ZIP、SHA-256、SBOM 和许可声明。  
-Run: `$env:BUILT_OFFLINE_PACKAGE = (Resolve-Path 'dist/umi-ocr-phase0-offline-rapid-v2.1.5-tool-v0.2.0.zip'); python -m pytest tests/test_offline_package.py -v -rs`  
+Real Run: `powershell -File scripts/build-offline-package.ps1`
+Expected: 下载并校验 103369422 字节 Umi 资产、11133606 字节 Python 资产和 9 个 wheels；便携运行时全套 pytest 通过；生成 ZIP、SHA-256、SBOM 和许可声明。
+Run: `$env:BUILT_OFFLINE_PACKAGE = (Resolve-Path 'dist/umi-ocr-phase0-offline-rapid-v2.1.5-tool-v0.2.0.zip'); python -m pytest tests/test_offline_package.py -v -rs`
 Expected: 3 passed，0 skipped。
 
 - [ ] **Step 7: 提交 Task 7**
@@ -1207,7 +1207,7 @@ def test_workflows_pin_official_actions_and_keep_release_draft():
 
 - [ ] **Step 2: 运行测试并确认 workflow 不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_offline_docs.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_offline_docs.py -v`
 Expected: FAIL，包含 `.github/workflows/test.yml` 不存在。
 
 - [ ] **Step 3: 实现 test.yml**
@@ -1249,10 +1249,10 @@ Workflow 仅 `workflow_dispatch` 和标签 `offline-v*` 触发，运行 `windows
 
 - [ ] **Step 5: 本地 YAML/契约验证**
 
-Run: `.venv/bin/python -m pytest tests/test_offline_docs.py tests/test_powershell_contract.py -v`  
-Expected: 0 failed。  
-Run: `git diff --check`  
-Expected: 无输出。  
+Run: `.venv/bin/python -m pytest tests/test_offline_docs.py tests/test_powershell_contract.py -v`
+Expected: 0 failed。
+Run: `git diff --check`
+Expected: 无输出。
 
 - [ ] **Step 6: 提交 Task 8**
 
@@ -1263,8 +1263,8 @@ git commit -m "ci: test and build offline validation package"
 
 - [ ] **Step 7: 推送并观察 CI**
 
-Run: `git push origin codex/umi-ocr-web-phase0`  
-Run: `gh run list --repo leileipei/OCR --branch codex/umi-ocr-web-phase0 --limit 3`  
+Run: `git push origin codex/umi-ocr-web-phase0`
+Run: `gh run list --repo leileipei/OCR --branch codex/umi-ocr-web-phase0 --limit 3`
 Expected: 最新 `test` workflow 的 Linux、macOS、Windows jobs 全部成功。
 
 ---
@@ -1294,7 +1294,7 @@ def test_release_workflow_only_creates_draft_with_expected_assets():
 
 - [ ] **Step 2: 运行测试并确认 workflow 不存在**
 
-Run: `.venv/bin/python -m pytest tests/test_offline_docs.py -v`  
+Run: `.venv/bin/python -m pytest tests/test_offline_docs.py -v`
 Expected: FAIL，包含 `release-offline-package.yml` 不存在。
 
 - [ ] **Step 3: 实现 release workflow**
@@ -1337,15 +1337,15 @@ git commit -m "ci: publish draft offline validation release"
 
 - [ ] **Step 6: 完成前新鲜验证**
 
-Run: `.venv/bin/python -m pytest -q`  
-Expected on macOS/Linux: 115 passed、2 个明确标记为仅 Windows 完整构建执行的 skipped、0 failed；Windows build job 设置 `BUILT_OFFLINE_PACKAGE` 后为 117 passed、0 skipped、0 failed。  
-Run: `.venv/bin/python -m compileall -q src tests`  
-Expected: exit 0。  
-Run: Python 3.8 grammar command  
-Expected: exit 0，输出解析文件数量且无 SyntaxError。  
-Run: `git diff --check origin/main..HEAD`  
-Expected: 无输出。  
-Run: secret scan for private keys, GitHub tokens, AWS keys, password fields  
+Run: `.venv/bin/python -m pytest -q`
+Expected on macOS/Linux: 115 passed、2 个明确标记为仅 Windows 完整构建执行的 skipped、0 failed；Windows build job 设置 `BUILT_OFFLINE_PACKAGE` 后为 117 passed、0 skipped、0 failed。
+Run: `.venv/bin/python -m compileall -q src tests`
+Expected: exit 0。
+Run: Python 3.8 grammar command
+Expected: exit 0，输出解析文件数量且无 SyntaxError。
+Run: `git diff --check origin/main..HEAD`
+Expected: 无输出。
+Run: secret scan for private keys, GitHub tokens, AWS keys, password fields
 Expected: 无真实凭据；模板中的字段名允许，值必须为空或示例域名。
 
 - [ ] **Step 7: 最终代码审查**
