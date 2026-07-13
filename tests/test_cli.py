@@ -1,35 +1,100 @@
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 import fitz
-from PIL import Image
+import pytest
+from PIL import Image, ImageDraw
 
 from umi_web_spike.cli import main
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+REQUIRED_CATEGORIES = {
+    "simplified_chinese_image",
+    "mixed_chinese_english_image",
+    "scanned_pdf_rotated_blank",
+    "native_text_pdf",
+    "corrupt_pdf",
+    "encrypted_pdf",
+}
 
 
-def _validation_args(tmp_path, *, global_values=None, page_count=1):
-    image = tmp_path / "sample.png"
-    Image.new("RGB", (32, 32), "white").save(image)
+def _image(path, text):
+    image = Image.new("RGB", (160, 80), "white")
+    ImageDraw.Draw(image).text((10, 10), text, fill="black")
+    image.save(path)
 
-    pdf = tmp_path / "sample.pdf"
+
+def _pdf(path, *, pages=1, native_text=False, encrypted=False):
     document = fitz.open()
-    for _ in range(page_count):
-        document.new_page(width=200, height=100)
-    document.save(pdf)
+    for index in range(pages):
+        page = document.new_page(width=200, height=100)
+        if native_text:
+            page.insert_text((20, 50), "native text")
+        if index == 0 and not native_text:
+            page.set_rotation(90)
+    kwargs = {}
+    if encrypted:
+        kwargs = {
+            "encryption": fitz.PDF_ENCRYPT_AES_256,
+            "owner_pw": "owner-secret",
+            "user_pw": "user-secret",
+        }
+    document.save(path, **kwargs)
     document.close()
 
+
+def _validation_args(
+    tmp_path,
+    *,
+    validation_id="run-20260713-001",
+    global_values=None,
+    min_pages=1,
+    scanned_pages=1,
+    scanned_native_text=False,
+):
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    simplified = samples / "simplified.png"
+    mixed = samples / "mixed.png"
+    _image(simplified, "zh")
+    _image(mixed, "zh EN")
+    scanned = samples / "scan.pdf"
+    _pdf(scanned, pages=scanned_pages, native_text=scanned_native_text)
+    native = samples / "native.pdf"
+    _pdf(native, native_text=True)
+    corrupt = samples / "corrupt.pdf"
+    corrupt.write_bytes(b"not a pdf")
+    encrypted = samples / "encrypted.pdf"
+    _pdf(encrypted, encrypted=True)
+
+    manifest = tmp_path / "samples.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "samples": [
+                    {"category": "simplified_chinese_image", "path": str(simplified)},
+                    {"category": "mixed_chinese_english_image", "path": str(mixed)},
+                    {"category": "scanned_pdf_rotated_blank", "path": str(scanned)},
+                    {"category": "native_text_pdf", "path": str(native)},
+                    {"category": "corrupt_pdf", "path": str(corrupt)},
+                    {"category": "encrypted_pdf", "path": str(encrypted)},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
     global_options = tmp_path / "global.json"
     local_options = tmp_path / "local.json"
     global_options.write_text(json.dumps(global_values or {}), encoding="utf-8")
-    local_options.write_text(json.dumps({}), encoding="utf-8")
-    output = tmp_path / "results"
-
+    local_options.write_text("{}", encoding="utf-8")
+    output = tmp_path / "runs" / validation_id
     return output, [
         "validate-ocr",
+        "--validation-id",
+        validation_id,
         "--plugin-root",
         str(PROJECT_ROOT / "tests" / "fakes"),
         "--plugin-name",
@@ -38,125 +103,160 @@ def _validation_args(tmp_path, *, global_values=None, page_count=1):
         str(global_options),
         "--local-options-json",
         str(local_options),
-        "--image",
-        str(image),
-        "--pdf",
-        str(pdf),
+        "--samples-manifest",
+        str(manifest),
         "--output-dir",
         str(output),
+        "--min-pages",
+        str(min_pages),
     ]
 
 
-def _read_result(output, name):
-    return json.loads((output / f"{name}.json").read_text(encoding="utf-8"))
+def _read(output, name):
+    return json.loads((output / name).read_text(encoding="utf-8"))
 
 
-def test_validate_ocr_writes_success_probe_results(tmp_path):
+def test_validate_ocr_publishes_complete_unique_atomic_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
     output, args = _validation_args(tmp_path)
 
-    code = main(args)
+    assert main(args) == 0
 
-    assert code == 0
-    assert _read_result(output, "ocr-image") == {
-        "ok": True,
-        "name": "ocr-image",
-        "details": {"code": 100, "blocks": 1},
-    }
-    pdf_result = _read_result(output, "ocr-pdf")
-    assert pdf_result["ok"] is True
-    assert pdf_result["name"] == "ocr-pdf"
-    assert pdf_result["details"] == {
-        "pages": 1,
-        "codes": [100],
-        "searchable_text": True,
-        "output": str(output / "searchable.pdf"),
-    }
-    resources = _read_result(output, "resources")
+    manifest = _read(output, "manifest.json")
+    assert manifest["status"] == "completed"
+    assert manifest["validation_id"] == "run-20260713-001"
+    evidence = [_read(output, name) for name in ("ocr-image.json", "ocr-pdf.json", "resources.json")]
+    assert all(item["schema_version"] == "1.0" for item in evidence)
+    assert all(item["validation_id"] == manifest["validation_id"] for item in evidence)
+    assert all(item["recorded_at_utc"].endswith("Z") for item in evidence)
+    assert all(item["plugin"]["name"] == "fake_ocr_plugin" for item in evidence)
+    assert all(Path(item["plugin"]["root"]).is_absolute() for item in evidence)
+    assert all(item["interpreter"]["executable"] == sys.executable for item in evidence)
+
+    sample_results = []
+    for item in evidence[:2]:
+        sample_results.extend(item["details"]["samples"])
+    assert {sample["category"] for sample in sample_results} == REQUIRED_CATEGORIES
+    assert all(sample["expected"] == sample["actual"] for sample in sample_results)
+    assert all(sample["ok"] is True for sample in sample_results)
+    for sample in sample_results:
+        assert sample["input_sha256"] == hashlib.sha256(Path(sample["path"]).read_bytes()).hexdigest()
+    scanned = next(sample for sample in sample_results if sample["category"] == "scanned_pdf_rotated_blank")
+    assert scanned["rotated_pages"] >= 1
+    assert scanned["blank_pages"] >= 1
+
+    resources = evidence[2]
+    details = resources["details"]
     assert resources["ok"] is True
-    assert resources["name"] == "resources"
-    assert resources["details"]["duration_seconds"] >= 0
-    assert resources["details"]["sampled_max_rss_bytes"] > 0
-    assert resources["details"]["qt_loaded"] is False
-    assert (output / "searchable.pdf").exists()
+    assert details["observed_peak_process_tree_rss_bytes"] > 0
+    assert details["process_tree_cpu_seconds"] >= 0
+    assert details["duration_seconds"] > 0
+    assert details["processed_pages"] >= 1
+    assert details["pages_per_minute"] > 0
+    assert details["sample_count"] >= 1
+    assert details["recommended_workers"] >= 1
+    assert details["worker_calculation_basis"]
+    assert details["qt_loaded"] is False
+    assert details["interactive_session"] is False
 
 
-def test_validate_ocr_returns_one_when_image_ocr_fails(tmp_path):
-    output, args = _validation_args(tmp_path, global_values={"fail_names": ["sample.png"]})
-
-    code = main(args)
-
-    assert code == 1
-    assert _read_result(output, "ocr-image") == {
-        "ok": False,
-        "name": "ocr-image",
-        "details": {"code": 500, "blocks": 0},
-    }
-
-
-def test_validate_ocr_returns_one_when_a_pdf_page_fails(tmp_path):
-    output, args = _validation_args(
-        tmp_path,
-        global_values={"fail_names": ["page-000002.png"]},
-        page_count=2,
-    )
-
-    code = main(args)
-
-    assert code == 1
-    pdf_result = _read_result(output, "ocr-pdf")
-    assert pdf_result["ok"] is False
-    assert pdf_result["name"] == "ocr-pdf"
-    assert pdf_result["details"]["pages"] == 2
-    assert pdf_result["details"]["codes"] == [100, 500]
-    assert pdf_result["details"]["searchable_text"] is False
-
-
-def test_validate_ocr_returns_one_when_qt_module_is_loaded(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_old_file", [False, True])
+def test_validate_ocr_refuses_to_reuse_even_empty_target_directory(tmp_path, monkeypatch, with_old_file):
+    monkeypatch.setenv("SESSIONNAME", "Services")
     output, args = _validation_args(tmp_path)
-    monkeypatch.setitem(sys.modules, "PyQt6", object())
+    output.mkdir(parents=True)
+    marker = output / "old-success.json"
+    if with_old_file:
+        marker.write_text('{"ok": true}', encoding="utf-8")
 
-    code = main(args)
+    assert main(args) == 1
+    if with_old_file:
+        assert marker.read_text(encoding="utf-8") == '{"ok": true}'
+    assert not (output / "manifest.json").exists()
 
-    assert code == 1
-    resources = _read_result(output, "resources")
+
+def test_validation_exception_atomically_publishes_failed_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path, global_values={"raise_names": ["mixed.png"]})
+
+    assert main(args) == 1
+    manifest = _read(output, "manifest.json")
+    assert manifest["status"] == "failed"
+    assert manifest["validation_id"] == "run-20260713-001"
+    assert isinstance(manifest["diagnostic"], str) and manifest["diagnostic"]
+    assert not list(output.parent.glob(".*.tmp"))
+
+
+def test_nonblank_image_requires_nonempty_ocr_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path, global_values={"empty_names": ["simplified.png"]})
+
+    assert main(args) == 1
+    image = _read(output, "ocr-image.json")
+    sample = next(item for item in image["details"]["samples"] if item["category"] == "simplified_chinese_image")
+    assert sample["actual"] == "empty_ocr_text"
+    assert sample["ok"] is False
+    assert image["ok"] is False
+
+
+def test_blank_image_cannot_claim_positive_image_coverage(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path)
+    manifest_path = Path(args[args.index("--samples-manifest") + 1])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    sample = next(item for item in manifest["samples"] if item["category"] == "simplified_chinese_image")
+    Image.new("RGB", (160, 80), "white").save(sample["path"])
+
+    assert main(args) == 1
+    image = _read(output, "ocr-image.json")
+    result = next(item for item in image["details"]["samples"] if item["category"] == "simplified_chinese_image")
+    assert result["input_nonblank"] is False
+    assert result["actual"] == "blank_input"
+
+
+def test_scanned_pdf_with_existing_text_layer_cannot_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path, scanned_native_text=True)
+
+    assert main(args) == 1
+    pdf = _read(output, "ocr-pdf.json")
+    sample = next(item for item in pdf["details"]["samples"] if item["category"] == "scanned_pdf_rotated_blank")
+    assert sample["source_has_text"] is True
+    assert sample["actual"] == "source_has_text"
+    assert sample["ok"] is False
+
+
+def test_default_resource_gate_requires_100_representative_pages(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path, min_pages=100, scanned_pages=2)
+
+    assert main(args) == 1
+    resources = _read(output, "resources.json")
+    assert resources["details"]["minimum_required_pages"] == 100
+    assert resources["details"]["processed_pages"] < 100
     assert resources["ok"] is False
-    assert resources["name"] == "resources"
-    assert resources["details"]["qt_loaded"] is True
 
 
-def test_windows_script_separates_test_and_plugin_python_at_project_root():
-    script = (PROJECT_ROOT / "scripts" / "run-windows-validation.ps1").read_text(
-        encoding="utf-8"
-    )
+def test_validation_id_must_match_output_directory_name(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    _, args = _validation_args(tmp_path)
+    args[args.index("--output-dir") + 1] = str(tmp_path / "runs" / "different-id")
+    assert main(args) == 1
 
-    assert "[Parameter(Mandatory=$true)][string]$TestPythonExe" in script
-    assert "Push-Location $ProjectRoot" in script
-    assert "& $TestPythonExe -m pytest -q" in script
-    assert "& $PythonExe -m pytest -q" not in script
-    assert script.count("& $PythonExe -m umi_web_spike.cli validate-ocr") == 1
-    assert "Pop-Location" in script
-    assert "Join-Path $ProjectRoot 'validation\\results\\live'" in script
 
-    original_path = "$OriginalPythonPath = $env:PYTHONPATH"
-    test_path = '$env:PYTHONPATH = "$ProjectRoot\\src"'
-    pytest_call = "& $TestPythonExe -m pytest -q"
-    pytest_check = "if ($LASTEXITCODE -ne 0)"
-    plugin_path = (
-        '$env:PYTHONPATH = "$ProjectRoot\\src;'
-        '$UmiDataRoot\\py_src\\imports;$UmiDataRoot\\site-packages"'
-    )
-    plugin_call = "& $PythonExe -m umi_web_spike.cli validate-ocr"
-    restore_path = "$env:PYTHONPATH = $OriginalPythonPath"
-    assert script.index(original_path) < script.index(test_path)
-    assert script.index(test_path) < script.index(pytest_call)
-    assert script.index(pytest_call) < script.index(pytest_check)
-    assert script.index(pytest_check) < script.index(plugin_path)
-    assert script.index(plugin_path) < script.index(plugin_call)
-    assert script.index("finally") < script.index(restore_path)
+def test_min_pages_cannot_be_zero_to_bypass_resource_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("SESSIONNAME", "Services")
+    output, args = _validation_args(tmp_path, min_pages=0)
+    assert main(args) == 1
+    assert _read(output, "manifest.json")["status"] == "failed"
 
-    samples_readme = (PROJECT_ROOT / "validation" / "samples" / "README.md").read_text(
-        encoding="utf-8"
-    )
-    assert "TestPythonExe" in samples_readme
-    assert "PythonExe" in samples_readme
-    assert "两个独立" in samples_readme
+
+def test_windows_script_uses_unique_run_and_manifest_contract():
+    script = (PROJECT_ROOT / "scripts" / "run-windows-validation.ps1").read_text(encoding="utf-8")
+    assert "[string]$ValidationId = ([guid]::NewGuid().ToString('N'))" in script
+    assert "validation\\results\\runs" in script
+    assert "'validation\\results\\live'" not in script
+    assert "--validation-id $ValidationId" in script
+    assert "--samples-manifest $SamplesManifest" in script
+    assert "--min-pages $MinPages" in script
+    assert "[int]$MinPages = 100" in script

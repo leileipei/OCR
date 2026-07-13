@@ -7,13 +7,15 @@ param(
   [Parameter(Mandatory=$true)][string]$PluginName,
   [Parameter(Mandatory=$true)][string]$GlobalOptions,
   [Parameter(Mandatory=$true)][string]$LocalOptions,
-  [Parameter(Mandatory=$true)][string]$Image,
-  [Parameter(Mandatory=$true)][string]$Pdf
+  [Parameter(Mandatory=$true)][string]$SamplesManifest,
+  [string]$ValidationId = ([guid]::NewGuid().ToString('N')),
+  [int]$MinPages = 100
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
-$OutputDir = Join-Path $ProjectRoot 'validation\results\live'
+$RunsRoot = Join-Path $ProjectRoot 'validation\results\runs'
+$OutputDir = Join-Path $RunsRoot $ValidationId
 $ExitCode = 0
 $OriginalPythonPath = $env:PYTHONPATH
 
@@ -26,13 +28,14 @@ try {
   } else {
     $env:PYTHONPATH = "$ProjectRoot\src;$UmiDataRoot\py_src\imports;$UmiDataRoot\site-packages"
     & $PythonExe -m umi_web_spike.cli validate-ocr `
+      --validation-id $ValidationId `
       --plugin-root $PluginRoot `
       --plugin-name $PluginName `
       --global-options-json $GlobalOptions `
       --local-options-json $LocalOptions `
-      --image $Image `
-      --pdf $Pdf `
-      --output-dir $OutputDir
+      --samples-manifest $SamplesManifest `
+      --output-dir $OutputDir `
+      --min-pages $MinPages
     $ExitCode = $LASTEXITCODE
   }
 } finally {

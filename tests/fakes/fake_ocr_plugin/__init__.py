@@ -16,6 +16,10 @@ class FakeApi:
             return {"code": 900, "data": "not started"}
         if Path(path).name in self.global_options.get("fail_names", []):
             return {"code": 500, "data": "configured failure"}
+        if Path(path).name in self.global_options.get("raise_names", []):
+            raise RuntimeError("configured plugin exception")
+        if Path(path).name in self.global_options.get("empty_names", []):
+            return {"code": 100, "data": []}
         return {
             "code": 100,
             "data": [{"text": path, "score": 1.0, "box": [[0, 0], [1, 0], [1, 1], [0, 1]]}],
