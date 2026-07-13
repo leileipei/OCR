@@ -89,6 +89,9 @@ def test_runtime_paths_and_attempts_are_reserved_under_campaign_mutex():
     assert "ValidateSet('Missing', 'MissingOrFile', 'File', 'Directory')" in text
     assert "Assert-Phase0NoReparsePoint" in text
     assert "Refusing to reuse existing attempt" in text
+    assert "$CampaignId.ToLowerInvariant()" in text
+    assert "$writer = $null" in text
+    assert "$stream.Dispose()" in text
 
 
 def test_prepare_uses_attempt_staging_and_atomic_campaign_publish():
@@ -266,6 +269,34 @@ def test_parallel_attempt_reservations_are_distinct_on_windows(tmp_path):
             text=True,
         )
         for _ in range(2)
+    ]
+    completed = [process.communicate(timeout=45) for process in processes]
+    assert all(process.returncode == 0 for process in processes), completed
+    assert sorted(int(stdout.strip()) for stdout, _ in completed) == [1, 2]
+
+
+def test_case_alias_campaigns_share_windows_mutex(tmp_path):
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if os.name != "nt" or not pwsh:
+        pytest.skip("Windows case-insensitive mutex behavior requires a Windows host")
+    package_root = tmp_path / "case-alias[root]"
+    package_root.mkdir()
+
+    def command(campaign_id):
+        return (
+            f"Import-Module '{PACKAGE}' -Force; "
+            f"$a = Get-Phase0AttemptContext -PackageRoot '{package_root}' "
+            f"-CampaignId {campaign_id}; [Console]::Out.WriteLine($a.number)"
+        )
+
+    processes = [
+        subprocess.Popen(
+            [pwsh, "-NoProfile", "-NonInteractive", "-Command", command(campaign_id)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for campaign_id in ("campaign-CASE", "campaign-case")
     ]
     completed = [process.communicate(timeout=45) for process in processes]
     assert all(process.returncode == 0 for process in processes), completed

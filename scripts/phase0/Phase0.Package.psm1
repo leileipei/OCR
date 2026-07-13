@@ -179,14 +179,22 @@ function Write-Phase0Utf8FileCreateNew {
         [System.IO.FileAccess]::Write,
         [System.IO.FileShare]::None
     )
-    $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+    $writer = $null
     try {
-        $writer.Write($Text)
-        $writer.Flush()
-        $stream.Flush($true)
+        try {
+            $writer = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+            $writer.Write($Text)
+            $writer.Flush()
+            $stream.Flush($true)
+        }
+        finally {
+            if ($null -ne $writer) {
+                $writer.Dispose()
+            }
+        }
     }
     finally {
-        $writer.Dispose()
+        $stream.Dispose()
     }
 }
 
@@ -266,7 +274,7 @@ function Get-Phase0MutexName {
     Assert-Phase0Identifier -Value $CampaignId -Name 'CampaignId'
     $algorithm = [System.Security.Cryptography.SHA256]::Create()
     try {
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant() + '|' + $CampaignId)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($root.ToLowerInvariant() + '|' + $CampaignId.ToLowerInvariant())
         $digest = $algorithm.ComputeHash($bytes)
     }
     finally {
