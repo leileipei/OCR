@@ -96,6 +96,7 @@ def verify_sha256sums(root, sums_path) -> None:
     root = Path(root).resolve()
     sums_path = Path(sums_path).resolve()
     listed = set()
+    listed_in_order = []
     for line in sums_path.read_text(encoding="utf-8").splitlines():
         if (
             len(line) < 67
@@ -108,10 +109,76 @@ def verify_sha256sums(root, sums_path) -> None:
             raise ValueError("malformed SHA256SUMS entry")
         if relative in listed:
             raise ValueError("duplicate SHA256SUMS path: {}".format(relative))
+        relative_path = PurePosixPath(relative)
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or "\\" in relative
+            or (relative_path.parts and ":" in relative_path.parts[0])
+        ):
+            raise ValueError("unsafe SHA256SUMS path: {}".format(relative))
         path = (root / relative).resolve()
         if root not in path.parents or not path.is_file() or sha256_file(path) != digest:
             raise ValueError("SHA256SUMS mismatch: {}".format(relative))
         listed.add(relative)
+        listed_in_order.append(relative)
+    if listed_in_order != sorted(listed_in_order):
+        raise ValueError("SHA256SUMS paths must be sorted")
     actual = {path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file() and path != sums_path}
     if actual != listed:
         raise ValueError("SHA256SUMS file set mismatch")
+
+
+def verify_package_manifest(root) -> None:
+    """Verify the release manifest and SHA256SUMS as strict file-set closures."""
+
+    root = Path(root).resolve()
+    manifest_path = root / "manifest.json"
+    sums_path = root / "SHA256SUMS.txt"
+    value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if set(value) != {"schema_version", "tool_version", "umi_version", "engine", "files"}:
+        raise ValueError("package manifest fields mismatch")
+    if (
+        value["schema_version"] != "1.0"
+        or value["tool_version"] != "0.2.0"
+        or value["umi_version"] != "2.1.5"
+        or value["engine"] != "RapidOCR"
+        or not isinstance(value["files"], list)
+    ):
+        raise ValueError("package manifest metadata mismatch")
+
+    expected_paths = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path not in {manifest_path, sums_path}
+    }
+    listed_paths = []
+    for entry in value["files"]:
+        if not isinstance(entry, dict) or set(entry) != {"path", "size", "sha256"}:
+            raise ValueError("package manifest file entry mismatch")
+        relative = entry["path"]
+        if not isinstance(relative, str):
+            raise ValueError("package manifest path must be a string")
+        relative_path = PurePosixPath(relative)
+        if (
+            not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or "\\" in relative
+            or (relative_path.parts and ":" in relative_path.parts[0])
+        ):
+            raise ValueError("unsafe package manifest path: {}".format(relative))
+        path = (root / relative).resolve()
+        if root not in path.parents or not path.is_file():
+            raise ValueError("package manifest file missing: {}".format(relative))
+        if entry["size"] != path.stat().st_size:
+            raise ValueError("package manifest size mismatch: {}".format(relative))
+        if entry["sha256"] != sha256_file(path):
+            raise ValueError("package manifest SHA-256 mismatch: {}".format(relative))
+        listed_paths.append(relative)
+
+    if listed_paths != sorted(listed_paths) or len(listed_paths) != len(set(listed_paths)):
+        raise ValueError("package manifest paths must be unique and sorted")
+    if set(listed_paths) != expected_paths:
+        raise ValueError("package manifest file set mismatch")
+    verify_sha256sums(root, sums_path)
