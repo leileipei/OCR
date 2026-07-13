@@ -72,13 +72,22 @@ def _sample(root, category):
     return value
 
 
-def valid_evidence(root, validation_id, execution_mode):
+def valid_evidence(
+    root,
+    validation_id,
+    execution_mode,
+    campaign_id="campaign-20260713-001",
+):
     common = {
         "schema_version": "1.0",
         "validation_id": validation_id,
         "recorded_at_utc": "2026-07-13T04:05:06Z",
     }
-    ocr_common = {**common, "execution_mode": execution_mode}
+    ocr_common = {
+        **common,
+        "campaign_id": campaign_id,
+        "execution_mode": execution_mode,
+    }
     official_document = root / "inputs" / "e10-official.pdf"
     official_document.parent.mkdir(parents=True, exist_ok=True)
     official_document.write_bytes(b"controlled official E10 document")
@@ -172,8 +181,16 @@ def valid_evidence(root, validation_id, execution_mode):
     }
 
 
-def write_evidence(root, validation_id, execution_mode, mutate=None):
-    evidence = deepcopy(valid_evidence(root, validation_id, execution_mode))
+def write_evidence(
+    root,
+    validation_id,
+    execution_mode,
+    mutate=None,
+    campaign_id="campaign-20260713-001",
+):
+    evidence = deepcopy(
+        valid_evidence(root, validation_id, execution_mode, campaign_id)
+    )
     if mutate:
         mutate(evidence)
     for name in ("e10.json", "ocr-image.json", "ocr-pdf.json", "resources.json"):

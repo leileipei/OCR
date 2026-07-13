@@ -62,6 +62,7 @@ def _validation_args(
     scanned_native_text=False,
     business_concurrency_limit=5,
     execution_mode="scheduled",
+    campaign_id="campaign-20260713-001",
 ):
     samples = tmp_path / "samples"
     samples.mkdir()
@@ -103,6 +104,8 @@ def _validation_args(
         "validate-ocr",
         "--validation-id",
         validation_id,
+        "--campaign-id",
+        campaign_id,
         "--plugin-root",
         str(PROJECT_ROOT / "tests" / "fakes"),
         "--plugin-name",
@@ -137,12 +140,14 @@ def test_validate_ocr_publishes_complete_unique_atomic_evidence(tmp_path, monkey
     manifest = _read(output, "manifest.json")
     assert manifest["status"] == "completed"
     assert manifest["validation_id"] == "run-20260713-001"
+    assert manifest["campaign_id"] == "campaign-20260713-001"
     assert set(manifest["evidence"]) == {"ocr-image.json", "ocr-pdf.json", "resources.json"}
     for name, digest in manifest["evidence"].items():
         assert digest == hashlib.sha256((output / name).read_bytes()).hexdigest()
     evidence = [_read(output, name) for name in ("ocr-image.json", "ocr-pdf.json", "resources.json")]
     assert all(item["schema_version"] == "1.0" for item in evidence)
     assert all(item["validation_id"] == manifest["validation_id"] for item in evidence)
+    assert all(item["campaign_id"] == manifest["campaign_id"] for item in evidence)
     assert all(item["recorded_at_utc"].endswith("Z") for item in evidence)
     assert all(item["execution_mode"] == "scheduled" for item in evidence)
     assert manifest["execution_mode"] == "scheduled"
@@ -241,6 +246,7 @@ def test_validation_exception_atomically_publishes_failed_manifest(tmp_path, mon
     manifest = _read(output, "manifest.json")
     assert manifest["status"] == "failed"
     assert manifest["validation_id"] == "run-20260713-001"
+    assert manifest["campaign_id"] == "campaign-20260713-001"
     assert isinstance(manifest["diagnostic"], str) and manifest["diagnostic"]
     assert "Traceback (most recent call last)" in manifest["traceback"]
     assert manifest["plugin"]["name"] == "fake_ocr_plugin"
@@ -319,6 +325,15 @@ def test_validation_id_must_match_output_directory_name(tmp_path, monkeypatch):
     _, args = _validation_args(tmp_path)
     args[args.index("--output-dir") + 1] = str(tmp_path / "runs" / "different-id")
     assert main(args) == 1
+
+
+def test_validate_ocr_requires_campaign_id(tmp_path):
+    _, args = _validation_args(tmp_path)
+    campaign_index = args.index("--campaign-id")
+    del args[campaign_index : campaign_index + 2]
+
+    with pytest.raises(SystemExit):
+        main(args)
 
 
 def test_min_pages_cannot_be_zero_to_bypass_resource_gate(tmp_path, monkeypatch):

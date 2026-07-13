@@ -31,6 +31,7 @@ EXPECTED_MODES = {"interactive", "scheduled"}
 class OcrEvidenceValidation:
     ok: bool
     validation_id: Optional[str]
+    campaign_id: Optional[str]
     errors: Dict[str, Tuple[str, ...]]
     summary: Dict[str, Any]
 
@@ -82,6 +83,14 @@ def _validate_common(
         validate_validation_id(value.get("validation_id"))
     except ValueError as error:
         _error(errors, source, str(error))
+    try:
+        validate_validation_id(value.get("campaign_id"))
+    except ValueError:
+        _error(
+            errors,
+            source,
+            "campaign_id must be 6-128 safe ASCII characters",
+        )
     if not is_utc_timestamp(value.get("recorded_at_utc")):
         _error(errors, source, "recorded_at_utc 必须是 UTC ISO-8601 时间")
     if value.get("execution_mode") != expected_mode:
@@ -357,6 +366,23 @@ def validate_ocr_evidence(
         for source in values:
             _error(errors, source, "validation_id 不一致，禁止跨运行混用证据")
 
+    campaign_values = [value.get("campaign_id") for value in values.values()]
+    campaign_ids = {
+        value for value in campaign_values if isinstance(value, str)
+    }
+    campaign_id = None
+    if len(campaign_ids) == 1 and all(
+        isinstance(value, str) for value in campaign_values
+    ):
+        candidate = next(iter(campaign_ids))
+        try:
+            campaign_id = validate_validation_id(candidate)
+        except ValueError:
+            pass
+    if campaign_id is None:
+        for source in values:
+            _error(errors, source, "campaign_id 不一致，禁止跨 campaign 混用证据")
+
     identities = []
     for source in ("image", "pdf", "resources"):
         _validate_identity(source, values[source], errors)
@@ -491,6 +517,7 @@ def validate_ocr_evidence(
     return OcrEvidenceValidation(
         ok=not any(immutable_errors.values()),
         validation_id=validation_id,
+        campaign_id=campaign_id,
         errors=immutable_errors,
         summary=summary,
     )

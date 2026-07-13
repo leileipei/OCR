@@ -342,12 +342,16 @@ def _resource_result(
 
 def _execute_validation(args: argparse.Namespace, working_dir: Path) -> bool:
     validation_id = validate_validation_id(args.validation_id)
+    campaign_id = validate_validation_id(args.campaign_id)
     if args.min_pages < 1:
         raise ValueError("min_pages must be at least 1")
     if args.business_concurrency_limit < 1:
         raise ValueError("business_concurrency_limit must be at least 1")
     recorded = utc_now()
-    common = {**envelope(validation_id, recorded), "execution_mode": args.execution_mode}
+    common = {
+        **envelope(validation_id, campaign_id, recorded),
+        "execution_mode": args.execution_mode,
+    }
     identity = execution_identity(Path(args.plugin_root), args.plugin_name)
     samples = _load_samples(Path(args.samples_manifest))
     sampler = ProcessTreeSampler()
@@ -401,6 +405,7 @@ def _validate_ocr(args: argparse.Namespace) -> int:
     output = Path(args.output_dir)
     try:
         validation_id = validate_validation_id(args.validation_id)
+        campaign_id = validate_validation_id(args.campaign_id)
     except ValueError:
         return 1
     if output.name != validation_id:
@@ -419,7 +424,7 @@ def _validate_ocr(args: argparse.Namespace) -> int:
             write_json(
                 temporary / "manifest.json",
                 {
-                    **envelope(validation_id, utc_now()),
+                    **envelope(validation_id, campaign_id, utc_now()),
                     "execution_mode": args.execution_mode,
                     "status": "failed",
                     "diagnostic": "{}: {}".format(type(error).__name__, error),
@@ -476,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     validate = subparsers.add_parser("validate-ocr")
     for name in (
-        "validation-id", "plugin-root", "plugin-name", "global-options-json",
+        "validation-id", "campaign-id", "plugin-root", "plugin-name", "global-options-json",
         "local-options-json", "samples-manifest", "output-dir",
     ):
         validate.add_argument("--" + name, required=True)

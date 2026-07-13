@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import shutil
 import zipfile
 from pathlib import Path
@@ -46,11 +47,26 @@ SENSITIVE_KEY_PARTS = (
     "ocr_text",
     "path",
 )
+RESERVED_STATUS_WORDS = (
+    "phase_0_passed",
+    "ocr_ready_e10_pending",
+    "phase_0_not_passed",
+)
+JSON_PATH_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_readiness_identifier(value: str, label: str) -> str:
+    value = validate_validation_id(value)
+    lowered = value.lower()
+    if any(status in lowered for status in RESERVED_STATUS_WORDS):
+        raise ValueError("{} contains a reserved status word".format(label))
+    return value
 
 
 def _validated_pair(
-    interactive_dir: Path, scheduled_dir: Path
+    campaign_id: str, interactive_dir: Path, scheduled_dir: Path
 ) -> Tuple[OcrEvidenceValidation, OcrEvidenceValidation]:
+    campaign_id = _validate_readiness_identifier(campaign_id, "campaign_id")
     interactive = validate_ocr_evidence(
         Path(interactive_dir), expected_mode="interactive"
     )
@@ -61,6 +77,20 @@ def _validated_pair(
         raise ValueError("interactive OCR evidence is invalid")
     if not scheduled.ok:
         raise ValueError("scheduled OCR evidence is invalid")
+    if interactive.campaign_id != campaign_id:
+        raise ValueError(
+            "interactive OCR evidence campaign_id does not match declared campaign"
+        )
+    if scheduled.campaign_id != campaign_id:
+        raise ValueError(
+            "scheduled OCR evidence campaign_id does not match declared campaign"
+        )
+    _validate_readiness_identifier(
+        interactive.validation_id, "interactive validation_id"
+    )
+    _validate_readiness_identifier(
+        scheduled.validation_id, "scheduled validation_id"
+    )
     if interactive.validation_id == scheduled.validation_id:
         raise ValueError(
             "interactive and scheduled runs must use different validation IDs"
@@ -123,26 +153,39 @@ def build_ocr_readiness_report(
     scheduled_dir: Path,
     output_path: Path,
 ) -> bool:
-    campaign_id = validate_validation_id(campaign_id)
-    interactive, scheduled = _validated_pair(interactive_dir, scheduled_dir)
+    campaign_id = _validate_readiness_identifier(campaign_id, "campaign_id")
+    interactive, scheduled = _validated_pair(
+        campaign_id, interactive_dir, scheduled_dir
+    )
     _write_new_text(
         Path(output_path), _report_text(campaign_id, interactive, scheduled)
     )
     return True
 
 
-def _reject_sensitive_keys(value: Any) -> None:
+def _child_json_path(path: str, key: str) -> str:
+    if JSON_PATH_IDENTIFIER.fullmatch(key):
+        return "{}.{}".format(path, key)
+    return "{}[{}]".format(path, json.dumps(key, ensure_ascii=True))
+
+
+def _reject_sensitive_keys(value: Any, path: str = "$") -> None:
     if isinstance(value, dict):
         for key, child in value.items():
             if not isinstance(key, str):
                 raise ValueError("review summary keys must be strings")
+            child_path = _child_json_path(path, key)
             lowered = key.lower()
             if any(part in lowered for part in SENSITIVE_KEY_PARTS):
-                raise ValueError("review summary contains a sensitive key")
-            _reject_sensitive_keys(child)
+                raise ValueError(
+                    "review summary contains a sensitive key at {}".format(
+                        child_path
+                    )
+                )
+            _reject_sensitive_keys(child, child_path)
     elif isinstance(value, list):
-        for child in value:
-            _reject_sensitive_keys(child)
+        for index, child in enumerate(value):
+            _reject_sensitive_keys(child, "{}[{}]".format(path, index))
     elif type(value) not in (str, int, float, bool):
         raise ValueError("review summary contains a disallowed value type")
 
@@ -241,8 +284,10 @@ def export_review_bundle(
     scheduled_dir: Path,
     output_zip: Path,
 ) -> Path:
-    campaign_id = validate_validation_id(campaign_id)
-    interactive, scheduled = _validated_pair(interactive_dir, scheduled_dir)
+    campaign_id = _validate_readiness_identifier(campaign_id, "campaign_id")
+    interactive, scheduled = _validated_pair(
+        campaign_id, interactive_dir, scheduled_dir
+    )
     summary = _review_summary(campaign_id, interactive, scheduled)
     output_zip = Path(output_zip)
     staging = output_zip.parent / (output_zip.stem + ".staging")

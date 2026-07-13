@@ -53,10 +53,13 @@ def execution_identity(plugin_root: Path, plugin_name: str) -> Dict[str, Dict[st
     }
 
 
-def envelope(validation_id: str, recorded_at_utc: str) -> Dict[str, str]:
+def envelope(
+    validation_id: str, campaign_id: str, recorded_at_utc: str
+) -> Dict[str, str]:
     return {
         "schema_version": SCHEMA_VERSION,
         "validation_id": validation_id,
+        "campaign_id": campaign_id,
         "recorded_at_utc": recorded_at_utc,
     }
 

@@ -18,6 +18,7 @@ def test_reusable_validator_accepts_same_evidence_as_full_report(tmp_path):
 
     assert validation.ok is True
     assert validation.validation_id == "run-scheduled-20260713"
+    assert validation.campaign_id == "campaign-20260713-001"
     assert validation.summary["processed_pages"] == 100
     assert validation.summary["execution_mode"] == "scheduled"
 
@@ -80,6 +81,45 @@ def test_validator_requires_execution_mode_on_all_four_envelopes(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("source", "campaign_value"),
+    [
+        (source, campaign_value)
+        for source in (
+            "ocr-image.json",
+            "ocr-pdf.json",
+            "resources.json",
+            "manifest.json",
+        )
+        for campaign_value in ("campaign-other-20260713", None)
+    ],
+)
+def test_validator_requires_one_campaign_id_on_all_four_envelopes(
+    tmp_path, source, campaign_value
+):
+    def mutate(evidence):
+        if campaign_value is None:
+            evidence[source].pop("campaign_id")
+        else:
+            evidence[source]["campaign_id"] = campaign_value
+
+    write_evidence(
+        tmp_path,
+        validation_id="run-scheduled-20260713",
+        execution_mode="scheduled",
+        mutate=mutate,
+    )
+
+    validation = validate_ocr_evidence(tmp_path, expected_mode="scheduled")
+
+    assert validation.ok is False
+    assert validation.campaign_id is None
+    assert any(
+        "campaign_id" in message
+        for messages in validation.errors.values()
+        for message in messages
+    )
+
 def test_validator_summary_does_not_leak_paths_or_ocr_text(tmp_path):
     evidence = write_evidence(
         tmp_path,
@@ -91,6 +131,7 @@ def test_validator_summary_does_not_leak_paths_or_ocr_text(tmp_path):
 
     serialized = json.dumps(validation.summary, ensure_ascii=False)
     assert validation.ok is True
+    assert "campaign_id" not in validation.summary
     assert set(validation.summary) == {
         "execution_mode",
         "windows_session_id",

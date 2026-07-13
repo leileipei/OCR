@@ -79,6 +79,19 @@ def test_report_rejects_cross_run_evidence(tmp_path, source):
     assert "validation_id" in report.read_text(encoding="utf-8")
 
 
+def test_report_rejects_inconsistent_ocr_campaign_envelope(tmp_path):
+    _write_evidence(
+        tmp_path,
+        lambda evidence: evidence["manifest.json"].__setitem__(
+            "campaign_id", "campaign-other-20260713"
+        ),
+    )
+    report = tmp_path / "report.md"
+
+    assert build_report(tmp_path, tmp_path / "e10.json", report) is False
+    assert "campaign_id" in report.read_text(encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     ("source", "field", "bad_value"),
     [

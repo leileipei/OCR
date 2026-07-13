@@ -1,3 +1,4 @@
+import hashlib
 import json
 import zipfile
 from dataclasses import replace
@@ -13,20 +14,27 @@ from umi_web_spike.readiness import (
 )
 
 
-def _write_pair(tmp_path):
+def _write_pair(
+    tmp_path,
+    campaign_id="campaign-20260713-001",
+    interactive_id="run-interactive-20260713",
+    scheduled_id="run-scheduled-20260713",
+):
     interactive = tmp_path / "interactive"
     scheduled = tmp_path / "scheduled"
-    interactive.mkdir()
-    scheduled.mkdir()
+    interactive.mkdir(parents=True)
+    scheduled.mkdir(parents=True)
     write_evidence(
         interactive,
-        validation_id="run-interactive-20260713",
+        validation_id=interactive_id,
         execution_mode="interactive",
+        campaign_id=campaign_id,
     )
     write_evidence(
         scheduled,
-        validation_id="run-scheduled-20260713",
+        validation_id=scheduled_id,
         execution_mode="scheduled",
+        campaign_id=campaign_id,
     )
     return interactive, scheduled
 
@@ -86,6 +94,59 @@ def test_readiness_rejects_same_validation_id_without_output(tmp_path):
     assert not report.exists()
 
 
+def test_readiness_rejects_two_valid_runs_from_different_campaigns(tmp_path):
+    interactive, _ = _write_pair(tmp_path / "first", campaign_id="campaign-first-20260713")
+    _, scheduled = _write_pair(
+        tmp_path / "second", campaign_id="campaign-second-20260713"
+    )
+    assert evidence_validation_module.validate_ocr_evidence(
+        interactive, expected_mode="interactive"
+    ).ok is True
+    assert evidence_validation_module.validate_ocr_evidence(
+        scheduled, expected_mode="scheduled"
+    ).ok is True
+    output = tmp_path / "review.zip"
+
+    with pytest.raises(ValueError, match="campaign"):
+        export_review_bundle(
+            "campaign-first-20260713", interactive, scheduled, output
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("context", "reserved_id"),
+    [
+        (context, "safe-{}-suffix".format(status))
+        for context in ("campaign", "interactive", "scheduled")
+        for status in (
+            "PhAsE_0_PaSsEd",
+            "OcR_ReAdY_E10_PeNdInG",
+            "PhAsE_0_NoT_PaSsEd",
+        )
+    ],
+)
+def test_readiness_rejects_reserved_status_words_in_all_ids(
+    tmp_path, context, reserved_id
+):
+    values = {
+        "campaign_id": "campaign-20260713-001",
+        "interactive_id": "run-interactive-20260713",
+        "scheduled_id": "run-scheduled-20260713",
+    }
+    values["{}_id".format(context)] = reserved_id
+    interactive, scheduled = _write_pair(tmp_path, **values)
+    output = tmp_path / "ocr-readiness.md"
+
+    with pytest.raises(ValueError, match="reserved status"):
+        build_ocr_readiness_report(
+            values["campaign_id"], interactive, scheduled, output
+        )
+
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("campaign_id", ["bad", "含中文的活动编号", "../../secret"])
 def test_readiness_rejects_invalid_campaign_id(tmp_path, campaign_id):
     interactive, scheduled = _write_pair(tmp_path)
@@ -136,12 +197,24 @@ def test_review_bundle_contains_only_deterministic_allowlisted_summary(tmp_path)
             archive.read(name).decode("utf-8") for name in names
         )
         summary = json.loads(archive.read("review-summary.json"))
+        checksum_lines = archive.read("SHA256SUMS.txt").decode("utf-8").splitlines()
+        archived_payloads = {
+            name: archive.read(name)
+            for name in ("review-summary.json", "ocr-readiness.md")
+        }
     assert names == [
         "review-summary.json",
         "ocr-readiness.md",
         "SHA256SUMS.txt",
     ]
     assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in infos)
+    assert all(info.compress_type == zipfile.ZIP_DEFLATED for info in infos)
+    assert all(info.create_system == 3 for info in infos)
+    assert all(info.external_attr == 0o100644 << 16 for info in infos)
+    checksums = dict(line.split("  ", 1)[::-1] for line in checksum_lines)
+    assert set(checksums) == {"review-summary.json", "ocr-readiness.md"}
+    for name, digest in checksums.items():
+        assert digest == hashlib.sha256(archived_payloads[name]).hexdigest()
     assert set(summary) == {
         "schema_version",
         "campaign_id",
@@ -180,11 +253,14 @@ def test_review_bundle_recursively_rejects_sensitive_summary_keys(
     )
     output = tmp_path / "review.zip"
 
-    with pytest.raises(ValueError, match="sensitive"):
+    expected_path = "$.interactive.nested[0].{}".format(sensitive_key)
+    with pytest.raises(ValueError, match="sensitive") as captured:
         export_review_bundle(
             "campaign-20260713-001", interactive, scheduled, output
         )
 
+    assert expected_path in str(captured.value)
+    assert "secret" not in str(captured.value)
     assert not output.exists()
     assert not list(tmp_path.glob("*.staging"))
 
