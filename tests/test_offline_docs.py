@@ -221,7 +221,12 @@ def test_release_workflow_is_tag_only_draft_with_least_privilege():
         r"(?m)^on:\n  push:\n    tags:\n      - 'offline-v\*'$",
         text,
     )
-    for forbidden_trigger in ("workflow_dispatch:", "pull_request:", "branches:"):
+    for forbidden_trigger in (
+        "workflow_dispatch:",
+        "pull_request:",
+        "pull_request_target:",
+        "branches:",
+    ):
         assert forbidden_trigger not in text
     permission_block = re.search(
         r"(?ms)^permissions:\n(?P<body>(?:  [^\n]+\n)+)\n",
@@ -242,6 +247,7 @@ def test_release_workflow_builds_on_windows_and_gates_release_after_validation()
     setup = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
     assert "runs-on: windows-latest" in text
     assert checkout in text and setup in text
+    assert "- uses: {}\n        with:\n          persist-credentials: false".format(checkout) in text
     uses = re.findall(r"(?m)^\s+- uses: ([^\s]+)$", text)
     assert uses == [checkout, setup]
     assert "python-version: '3.12.10'" in text
@@ -254,6 +260,18 @@ def test_release_workflow_builds_on_windows_and_gates_release_after_validation()
     assert "sbom.json" in text and "ConvertFrom-Json" in text
     assert "THIRD_PARTY_NOTICES.txt" in text
     assert "gh release create $env:GITHUB_REF_NAME" in text
+    release_step = text.index("- name: Create the draft release with the exact publication set")
+    assert "GH_TOKEN:" not in text[:release_step]
+    assert text.count("GH_TOKEN:") == 1
+    assert re.search(
+        r"(?ms)^      - name: Create the draft release with the exact publication set\n"
+        r"        shell: powershell\n"
+        r"        env:\n"
+        r"          GH_TOKEN: \$\{\{ github\.token \}\}\n"
+        r"        run: \|\n"
+        r"          gh release create \$env:GITHUB_REF_NAME",
+        text,
+    )
     required_order = [
         "python -m pytest -q",
         "scripts/build-offline-package.ps1",
