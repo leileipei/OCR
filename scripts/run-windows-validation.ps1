@@ -15,14 +15,16 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path $ProjectRoot).Path
 $OutputDir = Join-Path $ProjectRoot 'validation\results\live'
 $ExitCode = 0
+$OriginalPythonPath = $env:PYTHONPATH
 
-$env:PYTHONPATH = "$ProjectRoot\src;$UmiDataRoot\py_src\imports;$UmiDataRoot\site-packages"
 Push-Location $ProjectRoot
 try {
+  $env:PYTHONPATH = "$ProjectRoot\src"
   & $TestPythonExe -m pytest -q
   if ($LASTEXITCODE -ne 0) {
     $ExitCode = $LASTEXITCODE
   } else {
+    $env:PYTHONPATH = "$ProjectRoot\src;$UmiDataRoot\py_src\imports;$UmiDataRoot\site-packages"
     & $PythonExe -m umi_web_spike.cli validate-ocr `
       --plugin-root $PluginRoot `
       --plugin-name $PluginName `
@@ -34,6 +36,7 @@ try {
     $ExitCode = $LASTEXITCODE
   }
 } finally {
+  $env:PYTHONPATH = $OriginalPythonPath
   Pop-Location
 }
 exit $ExitCode

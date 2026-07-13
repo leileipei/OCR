@@ -137,6 +137,23 @@ def test_windows_script_separates_test_and_plugin_python_at_project_root():
     assert "Pop-Location" in script
     assert "Join-Path $ProjectRoot 'validation\\results\\live'" in script
 
+    original_path = "$OriginalPythonPath = $env:PYTHONPATH"
+    test_path = '$env:PYTHONPATH = "$ProjectRoot\\src"'
+    pytest_call = "& $TestPythonExe -m pytest -q"
+    pytest_check = "if ($LASTEXITCODE -ne 0)"
+    plugin_path = (
+        '$env:PYTHONPATH = "$ProjectRoot\\src;'
+        '$UmiDataRoot\\py_src\\imports;$UmiDataRoot\\site-packages"'
+    )
+    plugin_call = "& $PythonExe -m umi_web_spike.cli validate-ocr"
+    restore_path = "$env:PYTHONPATH = $OriginalPythonPath"
+    assert script.index(original_path) < script.index(test_path)
+    assert script.index(test_path) < script.index(pytest_call)
+    assert script.index(pytest_call) < script.index(pytest_check)
+    assert script.index(pytest_check) < script.index(plugin_path)
+    assert script.index(plugin_path) < script.index(plugin_call)
+    assert script.index("finally") < script.index(restore_path)
+
     samples_readme = (PROJECT_ROOT / "validation" / "samples" / "README.md").read_text(
         encoding="utf-8"
     )
