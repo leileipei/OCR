@@ -950,14 +950,6 @@ exit 0
         -ArgumentList "-NoProfile -NonInteractive -File `"$probeScript`"" `
         -WorkingDirectory $env:SystemRoot -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "non-admin ACL probe failed: $($process.ExitCode)" }}
-    $probePaths = @(
-        (Join-Path $paths.logs 'probe.log'),
-        (Join-Path $paths.output 'probe-output'),
-        (Join-Path $paths.temp 'probe.tmp')
-    )
-    foreach ($probePath in $probePaths) {{
-        if (-not (Test-Path -LiteralPath $probePath)) {{ throw "runtime probe was removed: $probePath" }}
-    }}
     if ((Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash -ne $argumentsHash -or
         (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash -ne $metadataHash) {{
         throw 'secure schedule evidence changed during low-privilege probe'
@@ -1119,9 +1111,12 @@ def test_credentialed_windows_probes_use_safe_system_working_directory():
     assert "'$($paths.logs)\\probe.log'" not in required_paths
     assert "'$($paths.output)\\probe-output'" not in required_paths
     assert "'$($paths.temp)\\probe.tmp'" not in required_paths
-    assert "$probePaths = @(" in schedule_probe
-    assert "foreach ($probePath in $probePaths)" in schedule_probe
-    assert "Test-Path -LiteralPath $probePath" in schedule_probe
+    assert "$probePaths = @(" not in schedule_probe
+    assert "runtime probe was removed" not in schedule_probe
+    assert "`$ErrorActionPreference = 'Stop'" in schedule_probe
+    assert "[System.IO.FileMode]::CreateNew" in schedule_probe
+    assert "[System.IO.Directory]::CreateDirectory('$($paths.output)\\probe-output')" in schedule_probe
+    assert "[System.IO.File]::WriteAllText('$($paths.temp)\\probe.tmp', 'ok')" in schedule_probe
     assert "catch [System.UnauthorizedAccessException]" not in schedule_probe
 
 
