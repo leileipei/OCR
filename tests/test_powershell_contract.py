@@ -885,37 +885,62 @@ $module = Import-Module '{SCHEDULER}' -Force -PassThru
     $metadataHash = (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash
     $child = @"
 `$ErrorActionPreference = 'Stop'
-function Test-AccessDeniedError {{
-    param(`$ErrorRecord)
-    `$exception = `$ErrorRecord.Exception
-    while (`$null -ne `$exception) {{
-        if (`$exception -is [System.UnauthorizedAccessException] -or
-            ((`$exception.HResult -band 0xFFFF) -eq 5)) {{ return `$true }}
-        `$exception = `$exception.InnerException
-    }}
-    return `$false
-}}
 `$log = New-Object System.IO.FileStream('$($paths.logs)\probe.log', [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
 `$log.WriteByte(1); `$log.Dispose()
 `$null = [System.IO.Directory]::CreateDirectory('$($paths.output)\probe-output')
 [System.IO.File]::WriteAllText('$($paths.temp)\probe.tmp', 'ok')
-foreach (`$target in @('$($paths.arguments)', '$($paths.metadata)')) {{
-    foreach (`$operation in @('write', 'delete', 'move')) {{
-        try {{
-            if (`$operation -eq 'write') {{ [System.IO.File]::WriteAllText(`$target, 'tampered') }}
-            elseif (`$operation -eq 'delete') {{ [System.IO.File]::Delete(`$target) }}
-            else {{ [System.IO.File]::Move(`$target, (`$target + '.moved')) }}
-            exit 12
-        }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
+`$protectedFiles = [ordered]@{{
+    '$($paths.arguments)' = '$argumentsHash'
+    '$($paths.metadata)' = '$metadataHash'
+}}
+`$requiredPaths = @(
+    '$($paths.secure)', '$($paths.attempt)', '$($paths.run)', '$($paths.scheduled)',
+    '$($paths.logs)', '$($paths.output)', '$($paths.temp)',
+    '$($paths.logs)\probe.log', '$($paths.output)\probe-output', '$($paths.temp)\probe.tmp'
+)
+`$moveSources = @(`$protectedFiles.Keys) + @(
+    '$($paths.secure)', '$($paths.attempt)', '$($paths.run)', '$($paths.scheduled)',
+    '$($paths.logs)', '$($paths.output)', '$($paths.temp)'
+)
+function Assert-ProbeState {{
+    foreach (`$entry in `$protectedFiles.GetEnumerator()) {{
+        `$path = [string]`$entry.Key
+        if (-not (Test-Path -LiteralPath `$path -PathType Leaf)) {{
+            throw "protected file was removed: `$path"
+        }}
+        if ((Get-FileHash -LiteralPath `$path -Algorithm SHA256).Hash -ne [string]`$entry.Value) {{
+            throw "protected file was changed: `$path"
+        }}
+    }}
+    foreach (`$path in `$requiredPaths) {{
+        if (-not (Test-Path -LiteralPath `$path)) {{
+            throw "partial deletion or move changed the ACL probe tree: `$path"
+        }}
+    }}
+    foreach (`$path in `$moveSources) {{
+        if (Test-Path -LiteralPath (`$path + '.moved')) {{
+            throw "partial deletion or move changed the ACL probe tree: `$path"
+        }}
     }}
 }}
-try {{ [System.IO.Directory]::Delete('$($paths.secure)', `$true); exit 13 }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
+function Invoke-ExpectedDeniedMutation {{
+    param([scriptblock]`$Operation)
+    try {{ & `$Operation }} catch {{ }}
+    Assert-ProbeState
+}}
+Assert-ProbeState
+foreach (`$target in @('$($paths.arguments)', '$($paths.metadata)')) {{
+    Invoke-ExpectedDeniedMutation {{ [System.IO.File]::WriteAllText(`$target, 'tampered') }}
+    Invoke-ExpectedDeniedMutation {{ [System.IO.File]::Delete(`$target) }}
+    Invoke-ExpectedDeniedMutation {{ [System.IO.File]::Move(`$target, (`$target + '.moved')) }}
+}}
+Invoke-ExpectedDeniedMutation {{ [System.IO.Directory]::Delete('$($paths.secure)', `$true) }}
 foreach (`$rootPath in @(
     '$($paths.attempt)', '$($paths.run)', '$($paths.scheduled)',
     '$($paths.logs)', '$($paths.output)', '$($paths.temp)'
 )) {{
-    try {{ [System.IO.Directory]::Delete(`$rootPath, `$true); exit 14 }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
-    try {{ [System.IO.Directory]::Move(`$rootPath, (`$rootPath + '.moved')); exit 15 }} catch {{ if (-not (Test-AccessDeniedError `$_)) {{ throw }} }}
+    Invoke-ExpectedDeniedMutation {{ [System.IO.Directory]::Delete(`$rootPath, `$true) }}
+    Invoke-ExpectedDeniedMutation {{ [System.IO.Directory]::Move(`$rootPath, (`$rootPath + '.moved')) }}
 }}
 exit 0
 "@
@@ -1076,8 +1101,13 @@ def test_credentialed_windows_probes_use_safe_system_working_directory():
     assert "$probeScript = Join-Path $root 'acl-probe.ps1'" in schedule_probe
     assert '-ArgumentList "-NoProfile -NonInteractive -File `"$probeScript`""' in schedule_probe
     assert "-EncodedCommand $encoded" not in schedule_probe
-    assert "function Test-AccessDeniedError" in schedule_probe
-    assert schedule_probe.count("if (-not (Test-AccessDeniedError `$_)) {{ throw }}") == 4
+    assert "function Test-AccessDeniedError" not in schedule_probe
+    assert "function Assert-ProbeState" in schedule_probe
+    assert "function Invoke-ExpectedDeniedMutation" in schedule_probe
+    assert schedule_probe.count("Invoke-ExpectedDeniedMutation") == 7
+    assert "Test-Path -LiteralPath `$path" in schedule_probe
+    assert "Get-FileHash -LiteralPath `$path" in schedule_probe
+    assert "partial deletion or move changed the ACL probe tree" in schedule_probe
     assert "catch [System.UnauthorizedAccessException]" not in schedule_probe
 
 
