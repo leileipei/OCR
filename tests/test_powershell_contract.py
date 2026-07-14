@@ -895,8 +895,7 @@ $module = Import-Module '{SCHEDULER}' -Force -PassThru
 }}
 `$requiredPaths = @(
     '$($paths.secure)', '$($paths.attempt)', '$($paths.run)', '$($paths.scheduled)',
-    '$($paths.logs)', '$($paths.output)', '$($paths.temp)',
-    '$($paths.output)\probe-output', '$($paths.temp)\probe.tmp'
+    '$($paths.logs)', '$($paths.output)', '$($paths.temp)'
 )
 `$moveSources = @(`$protectedFiles.Keys) + @(
     '$($paths.secure)', '$($paths.attempt)', '$($paths.run)', '$($paths.scheduled)',
@@ -951,8 +950,14 @@ exit 0
         -ArgumentList "-NoProfile -NonInteractive -File `"$probeScript`"" `
         -WorkingDirectory $env:SystemRoot -Wait -PassThru
     if ($process.ExitCode -ne 0) {{ throw "non-admin ACL probe failed: $($process.ExitCode)" }}
-    $logProbe = Join-Path $paths.logs 'probe.log'
-    if (-not (Test-Path -LiteralPath $logProbe)) {{ throw "protected log probe was removed: $logProbe" }}
+    $probePaths = @(
+        (Join-Path $paths.logs 'probe.log'),
+        (Join-Path $paths.output 'probe-output'),
+        (Join-Path $paths.temp 'probe.tmp')
+    )
+    foreach ($probePath in $probePaths) {{
+        if (-not (Test-Path -LiteralPath $probePath)) {{ throw "runtime probe was removed: $probePath" }}
+    }}
     if ((Get-FileHash -LiteralPath $paths.arguments -Algorithm SHA256).Hash -ne $argumentsHash -or
         (Get-FileHash -LiteralPath $paths.metadata -Algorithm SHA256).Hash -ne $metadataHash) {{
         throw 'secure schedule evidence changed during low-privilege probe'
@@ -1112,8 +1117,11 @@ def test_credentialed_windows_probes_use_safe_system_working_directory():
     assert "partial deletion or move changed the ACL probe tree" in schedule_probe
     required_paths = schedule_probe.split("`$requiredPaths = @(", 1)[1].split("\n)", 1)[0]
     assert "'$($paths.logs)\\probe.log'" not in required_paths
-    assert "$logProbe = Join-Path $paths.logs 'probe.log'" in schedule_probe
-    assert "Test-Path -LiteralPath $logProbe" in schedule_probe
+    assert "'$($paths.output)\\probe-output'" not in required_paths
+    assert "'$($paths.temp)\\probe.tmp'" not in required_paths
+    assert "$probePaths = @(" in schedule_probe
+    assert "foreach ($probePath in $probePaths)" in schedule_probe
+    assert "Test-Path -LiteralPath $probePath" in schedule_probe
     assert "catch [System.UnauthorizedAccessException]" not in schedule_probe
 
 
