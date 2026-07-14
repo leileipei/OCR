@@ -1,13 +1,22 @@
 import json
+import hashlib
+from pathlib import Path
 
 import pytest
 
 from umi_web_spike.e10_evidence import E10Evidence
 
 
+OFFICIAL_DOCUMENT = Path(__file__).resolve()
+
 VALID = {
+    "schema_version": "1.0",
+    "validation_id": "run-20260713-001",
+    "recorded_at_utc": "2026-07-13T04:05:06Z",
     "protocol": "oidc",
     "official_document_reference": "E10 客户开放平台/统一身份接口文档版本 10",
+    "official_document_path": str(OFFICIAL_DOCUMENT),
+    "official_document_sha256": hashlib.sha256(OFFICIAL_DOCUMENT.read_bytes()).hexdigest(),
     "login_endpoint": "https://oa.example.internal/sso/authorize",
     "verification_endpoint": "https://oa.example.internal/sso/userinfo",
     "external_user_id_field": "user_id",
@@ -15,6 +24,7 @@ VALID = {
     "test_login_succeeded": True,
     "disabled_account_rejected": True,
     "logout_behavior_verified": True,
+    "ready": True,
 }
 
 
@@ -75,6 +85,41 @@ def test_verification_results_must_be_json_booleans(field):
 
     with pytest.raises(ValueError, match=field):
         E10Evidence.from_dict(value)
+
+
+def test_ready_is_required_boolean_and_must_match_derived_tests():
+    for value in (
+        {key: item for key, item in VALID.items() if key != "ready"},
+        {**VALID, "ready": "true"},
+        {**VALID, "ready": False},
+        {**VALID, "test_login_succeeded": False, "ready": True},
+    ):
+        with pytest.raises(ValueError, match="ready"):
+            E10Evidence.from_dict(value)
+
+
+@pytest.mark.parametrize("digest", (None, "short", "G" * 64))
+def test_official_document_requires_valid_sha256(digest):
+    with pytest.raises(ValueError, match="official_document_sha256"):
+        E10Evidence.from_dict({**VALID, "official_document_sha256": digest})
+
+
+def test_official_document_sha256_is_recomputed_from_real_file(tmp_path):
+    document = tmp_path / "official.pdf"
+    document.write_bytes(b"official-v1")
+    value = {
+        **VALID,
+        "official_document_path": str(document.resolve()),
+        "official_document_sha256": hashlib.sha256(b"different").hexdigest(),
+    }
+    with pytest.raises(ValueError, match="does not match"):
+        E10Evidence.from_dict(value)
+
+
+@pytest.mark.parametrize("path", ("relative.pdf", "/definitely/missing/e10.pdf"))
+def test_official_document_path_must_be_absolute_existing_file(path):
+    with pytest.raises(ValueError, match="official_document_path"):
+        E10Evidence.from_dict({**VALID, "official_document_path": path})
 
 
 @pytest.mark.parametrize("field", ("login_endpoint", "verification_endpoint"))

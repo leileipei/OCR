@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "umi-web-spike"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.8.10,<3.13"
 dependencies = [
   "pillow>=10.4,<12",
